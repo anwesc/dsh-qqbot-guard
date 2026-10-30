@@ -1,0 +1,46 @@
+name: release
+
+# 发布走 npm 的 Trusted Publishing（OIDC）：不需要 token，也不需要 OTP。
+# 前提是在 npmjs.com 的包设置里配了这个 workflow：
+#   Package → Settings → Trusted publishing → GitHub Actions
+#   org/user = anwesc, repository = dsh-qqbot-guard, workflow filename = release.yml
+#   并勾上 "Allow npm publish"（2026-09-03 之后创建的配置默认只允许 npm stage publish）
+# 配置建立后 2 天内必须完成首次发布，否则作废。
+on:
+  push:
+    tags: [ 'v*' ]
+
+permissions:
+  id-token: write   # OIDC 换短期 publish 凭据
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
+      # Trusted publishing 需要 npm >= 11.5.1；显式升级，别赌 runner 自带的版本。
+      - name: npm >= 11.5.1
+        run: npm install -g npm@^11.6.2 && npm --version
+
+      - name: Tests
+        run: node --test *.test.mjs
+
+      # tag 与 package.json 版本不一致时直接失败，避免把 v1.2.3 发成 1.2.2。
+      - name: Version matches tag
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(node -p "require('./package.json').version")"
+          if [ "$tag" != "$pkg" ]; then
+            echo "tag $GITHUB_REF_NAME does not match package.json version $pkg" >&2
+            exit 1
+          fi
+
+      - name: Publish
+        run: npm publish --access public
