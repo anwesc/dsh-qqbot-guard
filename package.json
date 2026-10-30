@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "type": "module",
   "description": "qqbot 增强层：群聊关键词放行 + 历史上下文 + 进程内补丁（不改 qqbot 文件）",
+  "license": "MIT",
   "main": "./index.js",
   "exports": {
     ".": "./index.js"

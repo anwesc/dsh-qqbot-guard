@@ -220,3 +220,7 @@ PASS  表情标签不再以占位符形式出现
 
 - 不改 qqbot 源码，不写 `node_modules`，不碰 App 的 Java 层。
 - 媒体缓存、脚本、手册等其余增强项不在本插件范围内（另行安排）。
+
+## License
+
+MIT，见 [LICENSE](LICENSE)。Copyright (c) 2026 anwesc。
