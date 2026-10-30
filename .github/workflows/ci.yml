@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Unit tests
+        # discovery / boot 两组用例：前者覆盖 qqbot 包定位顺序，后者用假 qqbot 跑 apply()
+        run: node --test *.test.mjs
+
+      - name: Package contents
+        run: npm pack --dry-run
