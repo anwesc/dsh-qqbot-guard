@@ -21,7 +21,7 @@
  *     （含本地路径——落盘名带随机后缀，只能读的时候按前缀去 media 目录里找）。
  */
 import { pathToFileURL, fileURLToPath } from 'node:url';
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -140,6 +140,244 @@ export function mergeConfig(config = {}, logger = console) {
   const explicit = config ?? {};
   const file = readConfigFile(explicit, logger) ?? {};
   return { ...DEFAULT_CONFIG, ...file, ...explicit };
+}
+
+/** 设置页可以改的布尔开关。`configFile` 不在此列：让 UI 改自己的配置路径容易把用户锁死。 */
+const BOOLEAN_KEYS = [
+  'enabled',
+  'ignoreCase',
+  'faces',
+  'historyAttachments',
+  'historyMedia',
+  'verbose',
+  'strictVersion',
+];
+
+/**
+ * 归一化设置页提交的配置片段：只接受已知字段，字段值不合法时抛出带说明的错误。
+ * @param {unknown} input 请求体里的 JSON
+ * @returns {object} 只含已知字段的配置片段
+ */
+export function sanitizeConfigPatch(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    throw new Error('配置必须是一个 JSON 对象');
+  }
+  const out = {};
+  for (const key of BOOLEAN_KEYS) {
+    if (Object.hasOwn(input, key)) out[key] = Boolean(input[key]);
+  }
+  if (Object.hasOwn(input, 'triggers')) {
+    if (!Array.isArray(input.triggers)) throw new Error('triggers 必须是字符串数组');
+    const list = input.triggers.map((t) => String(t ?? '').trim()).filter(Boolean);
+    out.triggers = [...new Set(list)];
+  }
+  if (Object.hasOwn(input, 'historyMediaMaxMB')) {
+    const mb = Number(input.historyMediaMaxMB);
+    if (!Number.isFinite(mb) || mb <= 0 || mb > 1024) {
+      throw new Error('historyMediaMaxMB 需要 0~1024 之间的数字');
+    }
+    out.historyMediaMaxMB = mb;
+  }
+  if (Object.hasOwn(input, 'qqbotPackage')) {
+    out.qqbotPackage = String(input.qqbotPackage ?? '').trim();
+  }
+  return out;
+}
+
+/** 原子写 JSON：先写临时文件再 rename，写一半断电也不会留下半个配置文件。 */
+export function writeConfigFile(file, data) {
+  if (!file) throw new Error('没有可写的配置文件路径');
+  mkdirSync(dirname(file), { recursive: true });
+  const tmp = `${file}.${process.pid}.tmp`;
+  writeFileSync(tmp, `${JSON.stringify(data, null, 2)}\n`, 'utf8');
+  renameSync(tmp, file);
+}
+
+/** 读一个纯 JSON 文件；不存在或损坏返回 null。 */
+function readJsonFile(file) {
+  if (!file || !existsSync(file)) return null;
+  try {
+    const data = JSON.parse(readFileSync(file, 'utf8'));
+    return data && typeof data === 'object' && !Array.isArray(data) ? data : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 文件指纹：mtime + 大小。只改内容不改大小的情况极少，够用。 */
+function configStamp(file) {
+  if (!file) return 'missing';
+  try {
+    const s = statSync(file);
+    return `${s.mtimeMs}:${s.size}`;
+  } catch {
+    return 'missing';
+  }
+}
+
+/**
+ * 配置来源：cordis 之后还能被 JSON 文件覆盖，文件改了要能重读（设置页保存后即时生效）。
+ * @param {object} config cordis 里的 config
+ * @param {object} logger
+ */
+export function createConfigSource(config = {}, logger = console) {
+  const file = resolveConfigFile(config);
+  let stamp = configStamp(file);
+  let merged = mergeConfig(config, logger);
+  return {
+    /** 写回到哪个文件；没有可写路径时为 null */
+    file,
+    /** 当前生效的配置；文件 mtime/大小变了就重新合并 */
+    get() {
+      const next = configStamp(file);
+      if (next !== stamp) {
+        stamp = next;
+        merged = mergeConfig(config, logger);
+        logger.info?.(`[qqbot-guard] 配置已重新加载：${file}`);
+      }
+      return merged;
+    },
+    /** 强制重读（设置页保存后调用，省得等下一次轮询） */
+    reload() {
+      stamp = configStamp(file);
+      merged = mergeConfig(config, logger);
+      return merged;
+    },
+  };
+}
+
+/** 本机回环地址的「主机名:端口」；不认识的写法则返回 null。 */
+function loopbackAuthority(authority) {
+  if (typeof authority !== 'string' || authority === '') return null;
+  let url;
+  try {
+    url = new URL(`http://${authority}`);
+  } catch {
+    return null;
+  }
+  const host = url.hostname.toLowerCase();
+  if (host !== 'localhost' && host !== '127.0.0.1' && host !== '[::1]' && host !== '::1') return null;
+  return `${host}:${url.port}`;
+}
+
+/**
+ * 只允许本机回环来源改配置：Host 必须是回环（挡 DNS rebinding），
+ * 带 Origin 时还要求同源（挡别的网页用表单 POST 改配置）。
+ * 桌面端页面跑在 `dsh-app://` 下，必须显式放行。
+ * @param {object} request Node 的 IncomingMessage
+ */
+export function isSameOrigin(request) {
+  const hostKey = loopbackAuthority(request?.headers?.host);
+  if (hostKey === null) return false;
+  const origin = request?.headers?.origin;
+  if (origin === undefined || origin === '') return true;
+  try {
+    const url = new URL(origin);
+    if (url.protocol === 'dsh-app:') return true;
+    return loopbackAuthority(url.host) === hostKey;
+  } catch {
+    return false;
+  }
+}
+
+const CONFIG_PATH = '/qqbot-guard/config';
+const BODY_LIMIT_BYTES = 64 * 1024;
+
+function sendJson(response, status, value) {
+  response.writeHead(status, {
+    'cache-control': 'no-store',
+    'content-type': 'application/json; charset=utf-8',
+  });
+  response.end(JSON.stringify(value));
+}
+
+/** 读请求体并按上限保护；超过上限直接断开连接。 */
+function readBody(request, limit = BODY_LIMIT_BYTES) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+    request.on('data', (chunk) => {
+      size += chunk.length;
+      if (size > limit) {
+        reject(new Error('请求体过大'));
+        request.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    request.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    request.on('error', reject);
+  });
+}
+
+/** 设置页要的全部状态：配置、默认值、qqbot 定位结果。 */
+function configSnapshot(source, status, explicit = {}) {
+  return {
+    file: source.file ?? '',
+    config: source.get(),
+    defaults: DEFAULT_CONFIG,
+    status: { ...status },
+    // cordis 里的 config 优先级高于 JSON 文件；这些字段改设置页不会生效，得让 UI 说清楚
+    overridden: Object.keys(explicit ?? {}),
+  };
+}
+
+async function handleConfigRequest(request, response, source, log, status, explicit = {}) {
+  if (!isSameOrigin(request)) {
+    return sendJson(response, 403, { error: '来源不被信任（只允许本机回环地址）' });
+  }
+  const method = String(request?.method ?? 'GET').toUpperCase();
+  try {
+    if (method === 'GET') return sendJson(response, 200, configSnapshot(source, status, explicit));
+    if (method === 'PUT' || method === 'POST') {
+      if (!source.file) return sendJson(response, 400, { error: '没有可写的配置文件（缺少 DSH_HOME）' });
+      const patch = sanitizeConfigPatch(JSON.parse(await readBody(request)));
+      const next = { ...(readJsonFile(source.file) ?? {}), ...patch };
+      writeConfigFile(source.file, next);
+      source.reload();
+      log.info?.(`[qqbot-guard] 设置页已保存：${source.file}（${Object.keys(patch).join(', ') || '无改动'}）`);
+      return sendJson(response, 200, configSnapshot(source, status, explicit));
+    }
+    return sendJson(response, 405, { error: '不支持的方法' });
+  } catch (err) {
+    const message = String(err?.message ?? err);
+    log.warn?.(`[qqbot-guard] 配置请求失败：${message}`);
+    return sendJson(response, 400, { error: message });
+  }
+}
+
+/**
+ * 注册设置页用到的 HTTP 接口。
+ * qqbot 没装也要能打开设置页，所以调用点在 `findQqbotPackage` 之前。
+ * @returns {boolean} 宿主是否提供了 `inject`（有 webServer 时再异步挂载）
+ */
+export function installConfigApi(ctx, source, log, status = {}, explicit = {}) {
+  if (typeof ctx?.inject !== 'function') return false;
+  ctx.inject(['webServer'], (host) => {
+    const server = host?.webServer;
+    if (!server || typeof server.register !== 'function') {
+      log.warn?.('[qqbot-guard] webServer 不可用，设置页接口未注册');
+      return;
+    }
+    const mount = () => {
+      const dispose = server.register({
+        kind: 'exact',
+        path: CONFIG_PATH,
+        handler: (request, response) =>
+          handleConfigRequest(request, response, source, log, status, explicit),
+      });
+      return () => {
+        try {
+          dispose?.();
+        } catch {
+          /* 宿主已经在卸载路由了 */
+        }
+      };
+    };
+    if (typeof host.effect === 'function') host.effect(mount, 'qqbot-guard: config api');
+    else mount();
+  });
+  return true;
 }
 
 function parseVersion(v) {  const m = String(v ?? '').trim().match(/^(\d+)\.(\d+)\.(\d+)/);
@@ -561,12 +799,15 @@ export function createGuard(
   notes = new Map(),
   mediaDownloader = null,
 ) {
-  const triggers = (config.triggers ?? []).filter((t) => typeof t === 'string' && t.length > 0);
-  const ignoreCase = config.ignoreCase !== false;
-  const faces = config.faces !== false;
-  const historyAttachments = config.historyAttachments !== false;
+  // 设置页保存后要即时生效：每处理一条消息都读一次最新配置（数组很小，开销可以忽略）。
+  const read = typeof config === 'function' ? config : () => config;
 
   return async function qqbotGuard(ctx, next) {
+    const current = read() ?? DEFAULT_CONFIG;
+    const triggers = (current.triggers ?? []).filter((t) => typeof t === 'string' && t.length > 0);
+    const ignoreCase = current.ignoreCase !== false;
+    const faces = current.faces !== false;
+    const historyAttachments = current.historyAttachments !== false;
     try {
       const msg = ctx?.message;
       if (faces && typeof msg?.content === 'string') {
@@ -778,15 +1019,34 @@ export function installGuard(QQBot, guard, logger = console) {
 
 export async function apply(ctx, config) {
   const log = pickLogger(ctx);
-  const cfg = mergeConfig(config, log);
+  const source = createConfigSource(config, log);
+  const cfg = source.get();
+
+  /** 设置页显示的运行状态：qqbot 装在哪、补丁有没有生效。 */
+  const status = {
+    qqbot: '',
+    qqbotVersion: '',
+    sdk: '',
+    installed: false,
+    historyAttachments: false,
+    reason: '',
+  };
+  // 先挂配置接口：qqbot 没装、甚至 enabled=false 时，用户仍然要能打开设置页改配置。
+  installConfigApi(ctx, source, log, status, config);
 
   if (cfg.enabled === false) {
+    status.reason = 'enabled=false';
     log.info('[qqbot-guard] enabled=false，跳过（qqbot 行为保持原样）');
     return;
   }
 
   const qqbot = findQqbotPackage(cfg, log);
-  if (!qqbot) return;
+  if (!qqbot) {
+    status.reason = '没找到 @tencent-connect/dsh-qqbot';
+    return;
+  }
+  status.qqbot = qqbot.dir;
+  status.qqbotVersion = qqbot.pkg?.version ?? '';
 
   let sdkInfo;
   try {
@@ -824,12 +1084,15 @@ export async function apply(ctx, config) {
 
   const notes = new Map();
   const mediaDownloader = makeMediaDownloader(qqbot.dir, cfg, log);
-  const guard = createGuard(cfg, log, notes, mediaDownloader);
+  const guard = createGuard(() => source.get(), log, notes, mediaDownloader);
   const result = installGuard(sdk.QQBot, guard, log);
   if (!result.installed) {
+    status.reason = `补丁未安装：${result.reason}`;
     log.error(`[qqbot-guard] 补丁未安装：${result.reason}`);
     return;
   }
+  status.installed = true;
+  status.sdk = sdkInfo.version ?? '';
 
   let historyPatched = false;
   let mediaRoot = '';
@@ -854,6 +1117,7 @@ export async function apply(ctx, config) {
       log.warn(`[qqbot-guard] 历史附件摘要未启用: ${err?.message ?? err}`);
     }
   }
+  status.historyAttachments = historyPatched;
 
   if (cfg.verbose) {
     const cfgFile = resolveConfigFile(cfg);
