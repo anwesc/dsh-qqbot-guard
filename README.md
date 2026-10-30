@@ -50,8 +50,9 @@ mentions 后从正文摘掉。
 2. 装本插件：市场安装，或 `dsh plugin --profile web add dsh-qqbot-guard`；
 3. 本包自带 `dsh.bundle.patch`（`cordis.patch.yml`，用 `- insert:` 插入 `qqbot-guard` 行），
    被列入 `dsh.profile.bundles` 后会自动生效——**不要**在 profile 的 `cordis.patch.yml` 里再写一条同 id 的新行；
-4. 需要改参数时，二选一：
-   - **JSON 后门（手机端推荐）**：编辑 `$DSH_HOME/qqbot-guard.json`
+4. 需要改参数时，三选一（最终都落到同一个 `$DSH_HOME/qqbot-guard.json`）：
+   - **设置页（推荐，手机端也能用）**：DSH 里打开「设置 → QQ 守护」，改完点保存，**立即生效、不用重启**；
+   - **JSON 后门**：编辑 `$DSH_HOME/qqbot-guard.json`
      （App 里是 `/root/.dsh/qqbot-guard.json`，首次启动由 `PluginSeed` 生成）；
    - **profile patch 覆盖**（能写 YAML 时）：
 
@@ -119,6 +120,20 @@ mentions 后从正文摘掉。
 
 配置优先级：`DEFAULT_CONFIG` < 外部 JSON 文件 < cordis 里的 `config`。JSON 解析失败只会打一条
 warn 然后忽略，不会让插件挂掉——手机上手改坏了不会变砖。
+
+## 设置页（可视化配置）
+
+包导出 `./client`（`dsh.client.platform = web`），在 DSH 里注册一个设置板块「QQ 守护」：
+
+- 顶部状态行：qqbot 是否定位到、装在哪、SDK 版本、history 补丁是否生效——`找不到 qqbot` 这类
+  故障不用再翻 App 日志；
+- 关键词用每行一个的 textarea 编辑（空行忽略、自动去重），开关直接点；
+- 保存写的还是 `$DSH_HOME/qqbot-guard.json`（原子写：临时文件 + rename，不会写坏）；
+- guard 每收一条消息前检查文件指纹（mtime + size），变了就重新读——**保存即生效**，
+  在设置页和手改 JSON 之间来回切换也不会打架。
+
+接口是同源的 `GET/PUT /qqbot-guard/config`：只接受回环地址的 Host、拒绝跨站 Origin，
+请求体上限 64 KB，未知字段直接 400（防止手滑写进错字段还静默忽略）。
 
 ## 自检
 

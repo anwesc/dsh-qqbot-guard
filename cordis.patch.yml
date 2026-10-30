@@ -1,8 +1,11 @@
 # qqbot-guard bundle patch
 #
 # 本包被列入 profile 的 dsh.profile.bundles 后，dsh 启动时自动应用此 patch，
-# 把下面这一行插进插件树。真正的门禁参数请在 profile 的 cordis.patch.yml 里覆盖
-# （同 id 的普通 patch 会覆盖这里的默认值）。
+# 把下面这一行插进插件树。
+#
+# 故意不带 config：所有参数都由 $DSH_HOME/qqbot-guard.json（设置页写的就是它）
+# 或 DEFAULT_CONFIG 决定。cordis 的 config 优先级高于 JSON 文件——这里写一个键，
+# 设置页里对应的开关就再也改不动了，所以默认一个都不写。
 #
 # 注意：profile 的 cordis.patch.yml 只能改「已存在的 id」，新增插件行必须写在
 # bundle patch（本文件）里，或者用 `- insert:` 形式手动插入。
@@ -10,13 +13,3 @@
 - insert:
     - id: qqbot-guard
       name: 'dsh-qqbot-guard'
-      config:
-        # triggers 故意不写：由 $DSH_HOME/qqbot-guard.json 或 DEFAULT_CONFIG（大肥鱼/肥鱼/鱼鱼）决定，
-        # 手机端改关键词不用碰 YAML。要在这里写死也行，会盖过 JSON 文件。
-        ignoreCase: true
-        # 留空则自动探测：先看本插件自己所在的 node_modules（也就是 profile 布局
-        # <home>/profiles/<name>/node_modules），再看 <home>/profiles/*、<home>/plugins/*，
-        # 最后从 cwd 按 Node 规则向上找。只有自动探测落空时才需要在这里写死路径。
-        qqbotPackage: ''
-        strictVersion: false
-        verbose: true
