@@ -1,0 +1,51 @@
+{
+  "name": "dsh-qqbot-guard",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "qqbot 增强层：群聊关键词放行 + 历史上下文 + 进程内补丁（不改 qqbot 文件）",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "scripts": {
+    "selfcheck": "node selfcheck.mjs",
+    "test": "node --test *.test.mjs"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "cordis",
+    "plugin",
+    "qqbot",
+    "qq",
+    "tencent-connect"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/anwesc/dsh-qqbot-guard.git"
+  },
+  "homepage": "https://github.com/anwesc/dsh-qqbot-guard#readme",
+  "bugs": {
+    "url": "https://github.com/anwesc/dsh-qqbot-guard/issues"
+  },
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@tencent-connect/dsh-qqbot": ">=0.5.3"
+  },
+  "peerDependenciesMeta": {
+    "@tencent-connect/dsh-qqbot": {
+      "optional": true
+    }
+  }
+}
