@@ -1,7 +1,12 @@
 # qqbot-guard
 
+[![Listed on dsh-plugin.org](https://dsh-plugin.org/badges/listed.svg)](https://dsh-plugin.org/plugins/anwesc/dsh-qqbot-guard)
+
 **qqbot 增强层**（伴侣插件）。qqbot 主体仍由用户从插件市场安装（`@tencent-connect/dsh-qqbot`），
 本插件只做进程内补丁，不修改 qqbot / SDK 的任何磁盘文件。
+
+装上之后，群里发 **大肥鱼 / 肥鱼 / 鱼鱼**（可改）就能叫醒机器人，不用 @；群历史会带上图片、语音、
+文件的摘要。关键词和所有开关都在 DSH 的 **设置 → QQ 守护** 里改，保存即生效（1.1.0 起）。
 
 本仓库是 `dsh-qqbot-guard` 的**唯一真源**（源码、测试、发布都在这里）。
 两种来源，包名相同：从插件市场 / npm 单独安装（`dsh-qqbot-guard`），
