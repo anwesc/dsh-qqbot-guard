@@ -128,6 +128,8 @@ warn 然后忽略，不会让插件挂掉——手机上手改坏了不会变砖
 
 包导出 `./client`（`dsh.client.platform = web`），在 DSH 里注册一个设置板块「QQ 守护」：
 
+![设置 → QQ 守护](docs/settings-qqguard.png)
+
 - 顶部状态行：qqbot 是否定位到、装在哪、SDK 版本、history 补丁是否生效——`找不到 qqbot` 这类
   故障不用再翻 App 日志；
 - 关键词用每行一个的 textarea 编辑（空行忽略、自动去重），开关直接点；
