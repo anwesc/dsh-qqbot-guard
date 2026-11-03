@@ -68,6 +68,46 @@ export const DEFAULT_CONFIG = {
   historyMediaMaxMB: 20,
   /** SDK 版本超出白名单时是否仍然安装（默认只告警） */
   strictVersion: false,
+  /**
+   * 续聊窗口：关键词/@ 唤醒后，同一个群里不 @ 也能继续接话，
+   * 直到最后一条相关消息之后静默 `followUpWindowMinutes` 分钟。
+   */
+  followUpEnabled: true,
+  /** 窗口静默多久自动关闭（分钟）；窗口只活在内存里，插件重启即消失 */
+  followUpWindowMinutes: 10,
+  /** 一个窗口最多接几条相关消息（0 = 不限）；到量时本条仍放行，随后关窗 */
+  followUpMaxTurns: 0,
+  /**
+   * 短时间内连着来好几条时，先攒一批、只问一次判定（0 = 不合并，逐条判定）。
+   * 汇总只影响「判不判相关」，放行后仍是一条消息一轮、分别回复。
+   */
+  followUpBurstMs: 1200,
+  /** 一批最多攒几条（2~50）；攒满或超字数立即判定，不再等窗口 */
+  followUpBurstMax: 12,
+  /**
+   * 刷屏保护：窗口内消息数超过 followUpFloodMax 就进入「刷屏模式」，
+   * 安静 followUpFloodCooldownMs 后自动退出。只影响续聊判定路径，@/关键词照常放行。
+   */
+  followUpFloodWindowMs: 10000,
+  followUpFloodMax: 15,
+  followUpFloodCooldownMs: 25000,
+  /** 刷屏时怎么办：select = 只回判定挑中的相关消息（默认），skip = 整段不回 */
+  followUpFloodAction: 'select',
+  /** 一批达到几条才让判定模型挑「相关编号」；比这少仍按整体 1/0 判 */
+  followUpSelectMin: 5,
+  /** 判定用的模型；两项都留空时自动跟随 qqbot 当前会话模型，只填一项会尽量与默认模型拼成一对 */
+  followUpJudgeProvider: '',
+  followUpJudgeModel: '',
+  /** 单次判定超时（毫秒），超时按失败策略处理 */
+  followUpJudgeTimeoutMs: 6000,
+  /** 判定失败（报错/超时/答非所问）时：skip = 不接（默认），reply = 仍然接 */
+  followUpOnJudgeError: 'skip',
+  /**
+   * 群聊回复时带引用框（message_reference，引用被回复的那条消息）。
+   * 默认关：qqbot 的 sendMarkdown 不透传这个字段，插件要改走 send()；
+   * 平台是否接受「msg_id + message_reference」同时传需要真群验证，属于体验增强。
+   */
+  followUpQuoteReply: false,
   /** 是否输出诊断日志 */
   verbose: true,
 };
@@ -149,6 +189,8 @@ const BOOLEAN_KEYS = [
   'faces',
   'historyAttachments',
   'historyMedia',
+  'followUpEnabled',
+  'followUpQuoteReply',
   'verbose',
   'strictVersion',
 ];
@@ -180,6 +222,43 @@ export function sanitizeConfigPatch(input) {
   }
   if (Object.hasOwn(input, 'qqbotPackage')) {
     out.qqbotPackage = String(input.qqbotPackage ?? '').trim();
+  }
+  // 续聊窗口的数字项：范围写死，避免设置页把窗口调成 0 或负数后整个功能静默失灵。
+  const NUMBER_RULES = {
+    followUpWindowMinutes: [1, 1440, '1~1440 分钟'],
+    followUpMaxTurns: [0, 1000, '0~1000 条'],
+    followUpJudgeTimeoutMs: [500, 60000, '500~60000 毫秒'],
+    followUpBurstMs: [0, 5000, '0~5000 毫秒'],
+    followUpBurstMax: [2, 50, '2~50 条'],
+    followUpFloodWindowMs: [1000, 60000, '1000~60000 毫秒'],
+    followUpFloodMax: [1, 200, '1~200 条'],
+    followUpFloodCooldownMs: [1000, 600000, '1000~600000 毫秒'],
+    followUpSelectMin: [2, 50, '2~50 条'],
+  };
+  for (const [key, [min, max, label]] of Object.entries(NUMBER_RULES)) {
+    if (!Object.hasOwn(input, key)) continue;
+    const n = Number(input[key]);
+    if (!Number.isInteger(n) || n < min || n > max) {
+      throw new Error(`${key} 需要 ${label}之间的整数`);
+    }
+    out[key] = n;
+  }
+  for (const key of ['followUpJudgeProvider', 'followUpJudgeModel']) {
+    if (Object.hasOwn(input, key)) out[key] = String(input[key] ?? '').trim();
+  }
+  if (Object.hasOwn(input, 'followUpOnJudgeError')) {
+    const policy = String(input.followUpOnJudgeError ?? '').trim();
+    if (policy !== 'skip' && policy !== 'reply') {
+      throw new Error('followUpOnJudgeError 只能是 skip 或 reply');
+    }
+    out.followUpOnJudgeError = policy;
+  }
+  if (Object.hasOwn(input, 'followUpFloodAction')) {
+    const action = String(input.followUpFloodAction ?? '').trim();
+    if (action !== 'skip' && action !== 'select') {
+      throw new Error('followUpFloodAction 只能是 skip 或 select');
+    }
+    out.followUpFloodAction = action;
   }
   return out;
 }
@@ -787,20 +866,790 @@ function markMention(msg, extra = {}) {
   msg.mentions = mentions;
 }
 
+// ────────────────────────── 续聊窗口 ──────────────────────────
+
+/** 判定器最多看到几条最近消息（含机器人自己的发言） */
+const FOLLOWUP_RECENT_LIMIT = 8;
+/** 单条消息进提示词时最多留多少字，防止一条长文吃光预算 */
+const FOLLOWUP_TEXT_LIMIT = 240;
+/** 整个提示词的字数上限（判定只是二分类，不需要长上下文） */
+const FOLLOWUP_PROMPT_LIMIT = 2000;
+const FOLLOWUP_MIN_WINDOW_MS = 60_000;
+const FOLLOWUP_MAX_WINDOW_MS = 24 * 60 * 60_000;
+const FOLLOWUP_DEFAULT_WINDOW_MS = 10 * 60_000;
+const FOLLOWUP_MAX_WINDOWS = 500;
+/** 一批最多带多少字进判定提示词：攒过头就提前判定，别把一条批拖成小作文 */
+const FOLLOWUP_BURST_CHARS = 1200;
+
+function finiteNumber(value, fallback) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
 /**
- * 真正的门禁逻辑。挂在中间件链头部，做两件事：
+ * 「续聊窗口」的内存状态：一个群一个窗口。
+ *
+ * 窗口只负责回答两件事：这个群现在还要不要继续接话、还能接几条。
+ * 过期是**惰性**判定的（每次读写时算差值），不挂定时器，进程退出就全没了——
+ * 与 qqbot 自己的会话不同，这里丢窗口没有副作用：下一条 @ 或关键词会重新开窗，
+ * 群历史和 agent 会话都还在磁盘上。
+ *
+ * @param {object} [options]
+ * @param {() => number} [options.now] 时钟（测试用）
+ * @param {number | (() => number)} [options.windowMs] 静默多久关窗；传函数时每条消息实时读配置
+ * @param {number | (() => number)} [options.maxTurns] 窗口内最多接几条，0 = 不限
+ * @param {number} [options.recentLimit] 最近消息保留条数
+ */
+export function createFollowUpState(options = {}) {
+  const now = typeof options.now === 'function' ? options.now : () => Date.now();
+  const windowMs = () => {
+    const raw = typeof options.windowMs === 'function' ? options.windowMs() : options.windowMs;
+    return Math.min(
+      FOLLOWUP_MAX_WINDOW_MS,
+      Math.max(FOLLOWUP_MIN_WINDOW_MS, finiteNumber(raw, FOLLOWUP_DEFAULT_WINDOW_MS)),
+    );
+  };
+  const maxTurns = () => {
+    const raw = typeof options.maxTurns === 'function' ? options.maxTurns() : options.maxTurns;
+    return Math.max(0, Math.floor(finiteNumber(raw, 0)));
+  };
+  const recentLimit = Math.max(2, Math.floor(finiteNumber(options.recentLimit, FOLLOWUP_RECENT_LIMIT)));
+  const windows = new Map();
+
+  const keyOf = (key) => String(key ?? '');
+
+  /** 清掉过期窗口，避免长时间运行后 Map 只增不减 */
+  function prune() {
+    const t = now();
+    const ttl = windowMs();
+    for (const [key, win] of windows) {
+      if (t - win.lastRelatedAt > ttl) windows.delete(key);
+    }
+  }
+
+  /** 取一个仍然有效的窗口；过期就地删除并返回 null */
+  function get(key) {
+    const k = keyOf(key);
+    if (!k) return null;
+    const win = windows.get(k);
+    if (!win) return null;
+    if (now() - win.lastRelatedAt > windowMs()) {
+      windows.delete(k);
+      return null;
+    }
+    return win;
+  }
+
+  function open(key, info = {}) {
+    const k = keyOf(key);
+    if (!k) return null;
+    const t = now();
+    const win = {
+      key: k,
+      openedAt: t,
+      lastRelatedAt: t,
+      turns: 0,
+      failures: 0,
+      /** 上一次记失败的批次 id：同一批里的多条消息只记一次失败，避免瞬间凑满 3 次 */
+      lastFailureBatch: null,
+      trigger: String(info.trigger ?? ''),
+      recent: [],
+    };
+    windows.set(k, win);
+    if (windows.size > FOLLOWUP_MAX_WINDOWS) prune();
+    return win;
+  }
+
+  /**
+   * 窗口内接了一条相关消息：续期 + 计数。
+   * 达到 maxTurns 时**本条仍算放行**，但窗口立刻关掉（返回 closed=true）。
+   * @returns {{ turns: number, closed: boolean } | null} 窗口不存在/已过期时返回 null
+   */
+  function touch(key) {
+    const win = get(key);
+    if (!win) return null;
+    win.lastRelatedAt = now();
+    win.turns += 1;
+    const limit = maxTurns();
+    const closed = limit > 0 && win.turns >= limit;
+    if (closed) windows.delete(win.key);
+    return { turns: win.turns, closed };
+  }
+
+  function close(key) {
+    return windows.delete(keyOf(key));
+  }
+
+  /** 记一条群聊上文；只有窗口开着才记（关窗后的闲聊不占内存） */
+  function remember(key, entry = {}) {
+    const win = get(key);
+    if (!win) return false;
+    const text = String(entry.text ?? '').replace(/\s+/g, ' ').trim().slice(0, FOLLOWUP_TEXT_LIMIT);
+    if (!text) return false;
+    win.recent.push({
+      role: entry.role === 'bot' ? 'bot' : 'user',
+      name: String(entry.name ?? '').slice(0, 32),
+      text,
+      at: finiteNumber(entry.at, now()),
+      refIdx: String(entry.refIdx ?? ''),
+    });
+    if (win.recent.length > recentLimit) win.recent.splice(0, win.recent.length - recentLimit);
+    return true;
+  }
+
+  function recent(key) {
+    const win = get(key);
+    return win ? win.recent.map((e) => ({ ...e })) : [];
+  }
+
+  /** 这条引用指向的是不是机器人刚发的消息（靠出站补丁记下的 ref_idx） */
+  function matchesBotRef(key, refIdx) {
+    const ref = String(refIdx ?? '');
+    if (!ref) return false;
+    const win = get(key);
+    if (!win) return false;
+    return win.recent.some((e) => e.role === 'bot' && e.refIdx === ref);
+  }
+
+  function stats(key) {
+    const win = get(key);
+    if (!win) return null;
+    return {
+      openedAt: win.openedAt,
+      lastRelatedAt: win.lastRelatedAt,
+      turns: win.turns,
+      failures: win.failures,
+      remainingMs: Math.max(0, windowMs() - (now() - win.lastRelatedAt)),
+    };
+  }
+
+  function size() {
+    return windows.size;
+  }
+
+  function clear() {
+    windows.clear();
+  }
+
+  return { get, open, touch, close, remember, recent, matchesBotRef, stats, size, prune, clear };
+}
+
+/** 判定批次 id 全局递增：热重载会新建 batcher，但窗口状态可能被复用，不能各自从 1 数 */
+let BATCH_SEQ = 0;
+function nextBatchId() {
+  BATCH_SEQ += 1;
+  return BATCH_SEQ;
+}
+
+/**
+ * 短时间消息批量判定器。
+ *
+ * 第一条消息到达后先等 `windowMs`，期间到达的并入同一批；攒满 `maxItems`
+ * 或超 `maxChars` 时立即判定；`flush(key)` 可以强制提前判定。
+ * 一批只调用一次 `decide(items, key)`，所有等待者拿到同一个结论。
+ *
+ * `add()` 永不 reject：判定失败以 `{ verdict: null, error }` 返回，
+ * 让调用方按 `followUpOnJudgeError` 决定放不放行。
+ */
+export function createBurstBatcher(options = {}) {
+  const windowMs = () => {
+    const raw = typeof options.windowMs === 'function' ? options.windowMs() : options.windowMs;
+    return Math.max(0, Math.min(5000, finiteNumber(raw, 1200)));
+  };
+  const maxItems = () => {
+    const raw = typeof options.maxItems === 'function' ? options.maxItems() : options.maxItems;
+    return Math.max(2, Math.min(50, Math.floor(finiteNumber(raw, 12))));
+  };
+  const maxChars = Math.max(200, Math.floor(finiteNumber(options.maxChars, FOLLOWUP_BURST_CHARS)));
+  const decide = typeof options.decide === 'function' ? options.decide : null;
+  const batches = new Map();
+
+  function start(key) {
+    const batch = { id: nextBatchId(), key, items: [], waiters: [], chars: 0, timer: null, started: false };
+    batches.set(key, batch);
+    batch.timer = setTimeout(() => {
+      void run(batch);
+    }, windowMs());
+    // 不要 unref：批次还没判完时事件循环就空了，Node 22 的 test runner 会直接判
+    // "Promise resolution is still pending but the event loop has already resolved"
+    // 并取消后面的用例；这个定时器最多活一个窗口（几百毫秒到几秒），不必省。
+    return batch;
+  }
+
+  function settle(batch, result) {
+    const waiters = batch.waiters;
+    const items = batch.items;
+    batch.waiters = [];
+    batch.items = [];
+    waiters.forEach((resolve, i) => {
+      // 每条等待者拿到自己在批里的序号（1-based），select 模式据此判断「这条被挑中没有」。
+      resolve({ ...result, index: i + 1, count: result.count ?? items.length });
+    });
+  }
+
+  function run(batch) {
+    if (batch.started) return batch.promise;
+    batch.started = true;
+    if (batch.timer) {
+      clearTimeout(batch.timer);
+      batch.timer = null;
+    }
+    if (batches.get(batch.key) === batch) batches.delete(batch.key);
+    const items = batch.items.slice();
+    batch.promise = (async () => {
+      const outcome = { batchId: batch.id, count: items.length, verdict: null, selected: null, error: null };
+      if (items.length === 0) return outcome;
+      if (!decide) {
+        outcome.error = new Error('没有配置判定函数');
+      } else {
+        try {
+          // decide 可以返回布尔（逐条判定的老约定），也可以返回 {verdict, selected}
+          const decision = await decide(items, batch.key);
+          const verdict =
+            decision && typeof decision === 'object' && !Array.isArray(decision)
+              ? decision.verdict
+              : decision;
+          outcome.verdict = verdict === true ? true : verdict === false ? false : null;
+          outcome.selected = Array.isArray(decision?.selected) ? decision.selected : null;
+          if (outcome.verdict === null) outcome.error = new Error('判定结果无法解析');
+        } catch (err) {
+          outcome.error = err instanceof Error ? err : new Error(String(err));
+        }
+      }
+      settle(batch, outcome);
+      return outcome;
+    })();
+    return batch.promise;
+  }
+
+  function add(key, item) {
+    const k = String(key ?? '');
+    if (!k) {
+      return Promise.resolve({ batchId: 0, count: 0, verdict: null, error: new Error('没有群标识') });
+    }
+    const batch = batches.get(k) ?? start(k);
+    return new Promise((resolve) => {
+      batch.items.push(item);
+      batch.chars += String(item?.text ?? '').length;
+      batch.waiters.push(resolve);
+      if (batch.items.length >= maxItems() || batch.chars >= maxChars) void run(batch);
+    });
+  }
+
+  /** 强制把某个群当前攒着的这批立刻判定；没有待判定的返回 null */
+  async function flush(key) {
+    const batch = batches.get(String(key ?? ''));
+    return batch ? run(batch) : null;
+  }
+
+  function size() {
+    return batches.size;
+  }
+
+  function clear() {
+    for (const batch of batches.values()) {
+      if (batch.timer) clearTimeout(batch.timer);
+      settle(batch, {
+        batchId: batch.id,
+        count: batch.items.length,
+        verdict: null,
+        error: new Error('批量判定已中止'),
+      });
+    }
+    batches.clear();
+  }
+
+  return { add, flush, size, clear };
+}
+
+/**
+ * 按群串行：上一条消息的 `fn`（内部会 `await next()`）跑完，才轮下一条。
+ *
+ * 用来实现「分消息回复」：批量判定后如果同时放行，qqbot 的 concurrencyGuard
+ * 会把仍在处理中的消息 merge 成一个 ctx，只回一次；排成队一条条过，
+ * 每条都能独立成一轮、各回各的。
+ */
+export function createTurnQueue() {
+  const tails = new Map();
+
+  function run(key, fn) {
+    const k = String(key ?? '');
+    const previous = tails.get(k) ?? Promise.resolve();
+    const current = previous.then(fn, fn);
+    const tracked = current
+      .catch(() => {})
+      .then(() => {
+        if (tails.get(k) === tracked) tails.delete(k);
+      });
+    tails.set(k, tracked);
+    return current;
+  }
+
+  function size() {
+    return tails.size;
+  }
+
+  function clear() {
+    tails.clear();
+  }
+
+  return { run, size, clear };
+}
+
+/**
+ * 刷屏断路器。
+ *
+ * 每个群记一串最近的到达时间；`windowMs` 内条数达到 `maxItems` 就进入冷却
+ * `cooldownMs`，这期间判定路径上的消息直接不回（fast path 的 @/关键词不拦）。
+ * 每次进入冷却会把 `epoch` +1：排队等着放行的旧消息看到代次变了就自己丢弃，
+ * 免得冷却结束后把积压的几十条一次性倒出来。
+ */
+export function createFloodGate(options = {}) {
+  const now = typeof options.now === 'function' ? options.now : () => Date.now();
+  const windowMs = () =>
+    Math.max(1000, Math.min(60_000, finiteNumber(
+      typeof options.windowMs === 'function' ? options.windowMs() : options.windowMs,
+      10_000,
+    )));
+  const maxItems = () =>
+    Math.max(1, Math.min(200, Math.floor(finiteNumber(
+      typeof options.maxItems === 'function' ? options.maxItems() : options.maxItems,
+      15,
+    ))));
+  const cooldownMs = () =>
+    Math.max(1000, Math.min(600_000, finiteNumber(
+      typeof options.cooldownMs === 'function' ? options.cooldownMs() : options.cooldownMs,
+      25_000,
+    )));
+  const gates = new Map();
+
+  function state(key) {
+    let st = gates.get(key);
+    if (!st) {
+      st = { hits: [], until: 0, epoch: 0 };
+      gates.set(key, st);
+    }
+    return st;
+  }
+
+  /**
+   * 记一次到达，返回这一刻的状态。
+   * `triggered` 表示这一条把窗口打满了（刚进入冷却），`remainingMs` 是冷却剩余时间。
+   */
+  function observe(key) {
+    const k = String(key ?? '');
+    if (!k) return { flooding: false, triggered: false, epoch: 0, remainingMs: 0 };
+    const st = state(k);
+    const t = now();
+    st.hits = st.hits.filter((at) => t - at < windowMs());
+    st.hits.push(t);
+    let triggered = false;
+    if (st.hits.length >= maxItems()) {
+      triggered = true;
+      st.hits = [];
+      st.until = t + cooldownMs();
+      st.epoch += 1;
+    }
+    return {
+      flooding: t < st.until,
+      triggered,
+      epoch: st.epoch,
+      remainingMs: Math.max(0, st.until - t),
+    };
+  }
+
+  function isFlooding(key) {
+    return now() < state(String(key ?? '')).until;
+  }
+
+  function epoch(key) {
+    return state(String(key ?? '')).epoch;
+  }
+
+  function clear() {
+    gates.clear();
+  }
+
+  return { observe, isFlooding, epoch, size: () => gates.size, clear };
+}
+
+/** 群的窗口键：qqbot 的群消息带 groupOpenid，测试里也可能只给 peerId */
+function followUpKey(msg) {
+  const key = msg?.groupOpenid ?? msg?.peerId ?? '';
+  return typeof key === 'string' ? key : String(key ?? '');
+}
+
+/** 取引用消息的正文与「是不是在引用机器人」；msgElements 是 QQ 下发的原始引用内容 */
+function quotedBotInfo(msg, appId, isBotRef) {
+  const rawRef = msg?.refMsgIdx;
+  const refIdx = rawRef === undefined || rawRef === null ? '' : String(rawRef);
+  if (refIdx && isBotRef?.(refIdx) === true) return { quotedBot: true, refIdx, text: '' };
+  const element = Array.isArray(msg?.msgElements) ? msg.msgElements[0] : null;
+  const content = typeof element?.content === 'string' ? element.content.trim() : '';
+  if (!content) return { quotedBot: false, refIdx, text: '' };
+  const quotedBot = Boolean(appId) && (content.includes(`<@${appId}>`) || content.includes(`<@!${appId}>`));
+  return { quotedBot, refIdx, text: content.slice(0, FOLLOWUP_TEXT_LIMIT) };
+}
+
+const FOLLOWUP_JUDGE_RULES = [
+  '你在判断 QQ 群里的一条新消息，是否属于「机器人（AI）正在参与的同一个话题」。',
+  '只判断要不要让机器人接这句话，不要判断这句话本身。',
+  '判 1 的情况（满足其一）：',
+  '- 在追问、补充、反驳或继续机器人刚才在聊的事；',
+  '- 在跟机器人说话（例如接着机器人的提问回答），或明显想让它帮忙；',
+  '- 虽然是在回群友，但讨论的还是机器人参与的那个话题。',
+  '判 0 的情况（满足其一）：',
+  '- 开启了一个与机器人无关的新话题；',
+  '- 群友之间的闲聊、刷屏、表情、红包、公告、广告；',
+  '- 看不出和机器人刚才的话题有关，或信息不足以判断。',
+  '只输出一个字符：1 或者 0。不要解释，不要加代码块。',
+].join('\n');
+
+/**
+ * 拼判定器的单条用户消息。
+ * dsh-llm 的 request-only 输入只支持 user 角色，所以系统规则也塞进同一条消息里，
+ * 不依赖 createSystemMessage（本插件零依赖，拿不到 dsh-llm 的构造函数）。
+ */
+export function buildFollowUpJudgeInput({ recent = [], message = '', sender = '', quotedBot = false } = {}) {
+  const lines = [];
+  for (const entry of recent) {
+    if (!entry?.text) continue;
+    const who = entry.role === 'bot' ? '机器人' : entry.name || '群友';
+    lines.push(`${who}: ${entry.text}`);
+  }
+  const head = lines.length > 0 ? `[最近群聊]\n${lines.join('\n')}\n\n` : '';
+  const quoteNote = quotedBot ? '（引用了机器人的发言）' : '';
+  const body = `${head}[新消息] ${quoteNote}${sender ? `${sender}: ` : ''}${message}`;
+  return body.length > FOLLOWUP_PROMPT_LIMIT ? body.slice(body.length - FOLLOWUP_PROMPT_LIMIT) : body;
+}
+
+const FOLLOWUP_SELECT_RULES = [
+  '你在帮一个 QQ 群机器人过滤刷屏消息。',
+  '下面给出当前话题的最近群聊，以及一批新消息（每条带编号）。',
+  '判断每条新消息是否仍在延续机器人参与的那个话题：',
+  '- 延续（追问、补充、反驳、接着机器人刚说的事，或明显在找它帮忙）→ 保留它的编号；',
+  '- 无关（换成别的话题、纯表情、刷屏、公告广告、红包、看不出和机器人有关）→ 不保留。',
+  '只输出保留下来的编号，用英文逗号分隔，例如：1,3,7',
+  '如果一条都不相关，只输出：0',
+  '不要解释，不要加代码块，不要输出其他文字。',
+].join('\n');
+
+/** 拼「挑相关消息」的输入：最近群聊 + 编号列表 */
+export function buildFollowUpSelectInput({ recent = [], items = [] } = {}) {
+  const lines = [];
+  for (const entry of recent) {
+    if (!entry?.text) continue;
+    const who = entry.role === 'bot' ? '机器人' : entry.name || '群友';
+    lines.push(`${who}: ${entry.text}`);
+  }
+  const head = lines.length > 0 ? `[最近群聊]\n${lines.join('\n')}\n\n` : '';
+  const rows = items.map((it, i) => {
+    const who = it?.sender ? `${it.sender}: ` : '';
+    return `[${i + 1}] ${who}${String(it?.text ?? '')}`;
+  });
+  const body = `${head}[待判断消息]\n${rows.join('\n')}`;
+  return body.length > FOLLOWUP_PROMPT_LIMIT ? body.slice(0, FOLLOWUP_PROMPT_LIMIT) : body;
+}
+
+/**
+ * 解析「挑相关消息」的输出：返回 1-based 编号数组，[] 表示一条都不要，
+ * null 表示答非所问（调用方按判定失败处理）。
+ */
+export function parseFollowUpSelection(text, count) {
+  const total = Math.max(0, Math.floor(finiteNumber(count, 0)));
+  const cleaned = String(text ?? '')
+    .replace(/```[a-z]*|```/gi, '')
+    .trim();
+  if (cleaned === '') return null;
+  const numbers = cleaned.match(/\d+/g);
+  if (!numbers) return null;
+  const picked = new Set();
+  for (const raw of numbers) {
+    const n = Number(raw);
+    if (Number.isInteger(n) && n >= 1 && n <= total) picked.add(n);
+  }
+  if (picked.size > 0) return [...picked].sort((a, b) => a - b);
+  // 只剩 0（或「0」混在解释里）才认成「一条都不相关」
+  return numbers.some((n) => Number(n) === 0) ? [] : null;
+}
+
+/** 判定结果只认 1/0；模型偶尔会带空白、代码块或一句「1」的解释，做最小容错 */export function parseFollowUpVerdict(text) {
+  const cleaned = String(text ?? '')
+    .replace(/```[a-z]*|```/gi, '')
+    .trim();
+  if (cleaned === '') return null;
+  // 只有「1」「1.」「0」这类纯判定才直接采纳；带解释的交给下面的孤立数字兜底，
+  // 免得把「0 或 1」这种拿不准的输出当成明确的否定。
+  if (/^1[\s.。、,，:：!！)）]*$/.test(cleaned)) return true;
+  if (/^0[\s.。、,，:：!！)）]*$/.test(cleaned)) return false;
+  // 兜底：整段话里只有一个孤立的 0/1
+  const digits = cleaned.match(/(?<!\d)[01](?!\d)/g);
+  if (digits?.length === 1) return digits[0] === '1';
+  return null;
+}
+
+/**
+ * 判定模型路由：显式配置 > 宿主当前模型。
+ * 只填了一半时，尽量与宿主默认模型拼成一对；拼不出来就返回 null（调用方按失败策略处理）。
+ */
+export function resolveFollowUpRoute(config = {}, getRoute) {
+  const provider = String(config.followUpJudgeProvider ?? '').trim();
+  const model = String(config.followUpJudgeModel ?? '').trim();
+  let auto = null;
+  if (typeof getRoute === 'function') {
+    try {
+      auto = getRoute();
+    } catch {
+      auto = null;
+    }
+  }
+  const autoRoute =
+    auto?.provider && auto?.model ? { provider: String(auto.provider), model: String(auto.model) } : null;
+  if (provider && model) return { provider, model };
+  if (!provider && !model) return autoRoute;
+  if (provider && !model) {
+    return autoRoute && autoRoute.provider === provider ? { provider, model: autoRoute.model } : null;
+  }
+  // 只给了 model：只有当它与宿主默认模型同名时才敢沿用宿主的 provider
+  return autoRoute && autoRoute.model === model ? { provider: autoRoute.provider, model } : null;
+}
+
+/** 收流：只要文本，末块 finish 报错就抛（与 dsh-llm 的 finish 约定一致） */
+async function collectStreamText(stream) {
+  let text = '';
+  for await (const chunk of stream ?? []) {
+    if (chunk?.type === 'text-delta' && typeof chunk.text === 'string') {
+      text += chunk.text;
+      continue;
+    }
+    if (chunk?.type === 'finish') {
+      const reason = chunk.reason ?? chunk;
+      if (reason?.kind === 'error' || reason?.kind === 'aborted') {
+        throw new Error(reason?.failure?.message ?? `判定模型调用失败（${reason.kind}）`);
+      }
+    }
+  }
+  return text;
+}
+
+/** 调一次判定模型，收完整段文本；超时、上游失败、路由缺失都抛错 */
+async function callFollowUpModel({
+  llm,
+  route,
+  prompt,
+  timeoutMs = 6000,
+  maxTokens = 64,
+  logger = console,
+  label = '判定',
+} = {}) {
+  if (!llm || typeof llm.stream !== 'function') throw new Error('llm 服务不可用');
+  if (!route?.provider || !route?.model) throw new Error('没有可用的判定模型');
+  const limit = Math.min(60_000, Math.max(500, finiteNumber(timeoutMs, 6000)));
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), limit);
+  try {
+    const stream = llm.stream({
+      provider: route.provider,
+      model: route.model,
+      messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
+      maxTokens,
+      signal: controller.signal,
+    });
+    const text = await collectStreamText(stream);
+    return { text, route };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * 跑一次相关性判定：属于当前话题返回 true，不属于返回 false，失败抛异常。
+ * @param {object} options
+ * @param {object} options.llm dsh 的 llm 服务（ctx.get('llm')）
+ * @param {{provider: string, model: string}} options.route
+ */
+export async function runFollowUpJudge({
+  llm,
+  route,
+  recent = [],
+  message = '',
+  sender = '',
+  quotedBot = false,
+  timeoutMs = 6000,
+  logger = console,
+} = {}) {
+  const prompt = `${FOLLOWUP_JUDGE_RULES}\n\n${buildFollowUpJudgeInput({ recent, message, sender, quotedBot })}`;
+  const { text } = await callFollowUpModel({
+    llm,
+    route,
+    prompt,
+    timeoutMs,
+    maxTokens: 64,
+    logger,
+    label: '判定',
+  });
+  const verdict = parseFollowUpVerdict(text);
+  if (verdict === null) throw new Error(`判定模型返回无法解析：${JSON.stringify(text.slice(0, 40))}`);
+  logger.debug?.(`[qqbot-guard] 判定 ${route.provider}/${route.model} → ${verdict ? 1 : 0}`);
+  return verdict;
+}
+
+/**
+ * 刷屏/多条时的一次「挑相关」：返回要回复的 1-based 编号，[] 表示一条都不回。
+ * 失败抛异常，由调用方按 followUpOnJudgeError 处理。
+ */
+export async function runFollowUpSelectJudge({
+  llm,
+  route,
+  recent = [],
+  items = [],
+  timeoutMs = 6000,
+  logger = console,
+} = {}) {
+  const prompt = `${FOLLOWUP_SELECT_RULES}\n\n${buildFollowUpSelectInput({ recent, items })}`;
+  const { text } = await callFollowUpModel({
+    llm,
+    route,
+    prompt,
+    timeoutMs,
+    maxTokens: 128,
+    logger,
+    label: '挑选',
+  });
+  const selected = parseFollowUpSelection(text, items.length);
+  if (selected === null) {
+    throw new Error(`判定模型返回无法解析：${JSON.stringify(text.slice(0, 40))}`);
+  }
+  logger.debug?.(
+    `[qqbot-guard] 挑选 ${route.provider}/${route.model} → ${
+      selected.length > 0 ? selected.join(',') : '0'
+    }（共 ${items.length} 条）`,
+  );
+  return selected;
+}
+
+/**
+ * 记一条放行消息：先续期/开窗，再写进判定器能看到的上文。
+ * 窗口刚过期或刚好被 maxTurns 关掉时，按「新窗口」处理——这条消息本身已经判定为相关。
+ */
+function confirmFollowUpWindow(followUp, key, trigger) {
+  let turn = followUp.touch(key);
+  if (!turn) {
+    followUp.open(key, { trigger });
+    turn = followUp.touch(key);
+  }
+  return turn;
+}
+
+function rememberGroupMessage(followUp, key, msg, text) {
+  const attachments = summarizeAttachments(msg?.attachments);
+  followUp.remember(key, {
+    role: 'user',
+    name: msg?.senderName ?? msg?.senderId ?? '',
+    text: text || attachments,
+    at: Date.now(),
+  });
+}
+
+/**
+ * 真正的门禁逻辑。挂在中间件链头部，做三件事：
  * 1. 正文里的表情标签换成可读文本（历史与当前消息都受益）；
  * 2. 群聊命中关键词时给 `msg.mentions` 补 `{ is_you: true }`，让下游 mentionGate
- *    判成“被 @”，从而放行并拼上群历史。**绝不改 `msg.content`**（历史会被污染）。
+ *    判成“被 @”，从而放行并拼上群历史。**绝不改 `msg.content`**（历史会被污染）；
+ * 3. 续聊窗口：唤醒后同一群里没 @ 的消息，先问一次判定模型「还是同一个话题吗」，
+ *    是就同样补 mention 放行，不是就原样交给 mentionGate 拦停（群里零输出）。
+ *    短时间多条合并判定、逐条放行；刷屏时按 followUpFloodAction 静默或只回挑中的相关消息。
+ *
+ * @param {object|(() => object)} config 配置或配置读取函数
+ * @param {object} logger
+ * @param {Map} notes 附件摘要（历史用）
+ * @param {Function|null} mediaDownloader 附件预下载
+ * @param {object} [options]
+ * @param {object} [options.followUp] createFollowUpState() 的实例；不传 = 不启用续聊
+ * @param {() => object} [options.getLlm] 取 dsh 的 llm 服务
+ * @param {() => object} [options.getRoute] 取宿主当前模型（agentDefaultModel.currentSelection）
+ * @param {object} [options.flood] createFloodGate() 的实例；不传 = 自动建
  */
 export function createGuard(
   config = DEFAULT_CONFIG,
   logger = console,
   notes = new Map(),
   mediaDownloader = null,
+  options = {},
 ) {
   // 设置页保存后要即时生效：每处理一条消息都读一次最新配置（数组很小，开销可以忽略）。
   const read = typeof config === 'function' ? config : () => config;
+  const followUp = options?.followUp ?? null;
+  const getLlm = typeof options?.getLlm === 'function' ? options.getLlm : null;
+  const getRoute = typeof options?.getRoute === 'function' ? options.getRoute : null;
+
+  // 跨消息状态：批量判定器（短时间多条只问一次）+ 按群串行队列（一条一轮地放行）
+  // + 刷屏断路器（短时间大量消息直接静默、或只回挑中的那几条）。
+  const turnQueue = createTurnQueue();
+  const flood =
+    followUp && options?.flood !== false
+      ? options.flood ??
+        createFloodGate({
+          windowMs: () => (read() ?? DEFAULT_CONFIG).followUpFloodWindowMs,
+          maxItems: () => (read() ?? DEFAULT_CONFIG).followUpFloodMax,
+          cooldownMs: () => (read() ?? DEFAULT_CONFIG).followUpFloodCooldownMs,
+        })
+      : null;
+  const burst =
+    followUp && options?.burst !== false
+      ? options.burst ??
+        createBurstBatcher({
+          windowMs: () => (read() ?? DEFAULT_CONFIG).followUpBurstMs,
+          maxItems: () => (read() ?? DEFAULT_CONFIG).followUpBurstMax,
+          decide: decideFollowUpBurst,
+        })
+      : null;
+
+  /**
+   * 把一批消息合成一次判定；最近上下文取判定那一刻的窗口内容。
+   * 返回 `{verdict, selected}`：selected 是 select 模式挑中的 1-based 编号，
+   * 逐条判定时为 null（表示「整批同进退」）。
+   */
+  async function decideFollowUpBurst(items, key) {
+    const cfg = read() ?? DEFAULT_CONFIG;
+    const llm = getLlm ? getLlm() : null;
+    if (!llm?.stream) throw new Error('llm 服务不可用');
+    const route = resolveFollowUpRoute(cfg, getRoute);
+    if (!route) throw new Error('没有可用的判定模型（请配置 followUpJudgeProvider/Model）');
+    const recent = followUp?.get(key)?.recent ?? [];
+    // 刷屏中、或这一批本来就够大：让模型挑出仍然相关的编号，只回这几条。
+    const selectMin = Math.max(2, Math.floor(finiteNumber(cfg.followUpSelectMin, 5)));
+    const useSelect =
+      cfg.followUpFloodAction === 'select' &&
+      (items.length >= selectMin || items.some((it) => it.flooding === true));
+    if (useSelect) {
+      const selected = await runFollowUpSelectJudge({
+        llm,
+        route,
+        recent,
+        items: items.map((it) => ({ text: it.text, sender: it.sender })),
+        timeoutMs: cfg.followUpJudgeTimeoutMs,
+        logger,
+      });
+      return { verdict: selected.length > 0, selected };
+    }
+    const lines = items.map((it) => `${it.sender ? `${it.sender}: ` : ''}${it.text}`);
+    const message =
+      items.length > 1
+        ? `（短时间内连续 ${items.length} 条消息，请整体判断）\n${lines.join('\n')}`
+        : lines[0] ?? '';
+    const verdict = await runFollowUpJudge({
+      llm,
+      route,
+      recent,
+      message,
+      sender: '',
+      quotedBot: items.some((it) => it.quotedBot === true),
+      timeoutMs: cfg.followUpJudgeTimeoutMs,
+      logger,
+    });
+    return { verdict, selected: null };
+  }
 
   return async function qqbotGuard(ctx, next) {
     const current = read() ?? DEFAULT_CONFIG;
@@ -808,6 +1657,8 @@ export function createGuard(
     const ignoreCase = current.ignoreCase !== false;
     const faces = current.faces !== false;
     const historyAttachments = current.historyAttachments !== false;
+    // 本条消息是否已经把链交给续聊队列（交了就不在函数末尾再 next 一次）
+    let released = false;
     try {
       const msg = ctx?.message;
       if (faces && typeof msg?.content === 'string') {
@@ -866,12 +1717,167 @@ export function createGuard(
             }
           }
         }
+
+        // 续聊窗口：@/关键词/引用机器人 直接续期；其余消息问一次判定模型，相关才补 mention。
+        // 不相关就什么都不做，mentionGate 会以 no_mention 拦停——群里不会出现「我不接这句」的提示。
+        if (followUp && current.followUpEnabled !== false && msg.senderIsBot !== true) {
+          const groupKey = followUpKey(msg);
+          if (groupKey) {
+            const mentionedNow =
+              Array.isArray(msg.mentions) && msg.mentions.some((m) => m?.is_you === true);
+            const keywordHit =
+              typeof ctx.state?.qqbotGuard?.trigger === 'string' ? ctx.state.qqbotGuard.trigger : '';
+            const quote = quotedBotInfo(msg, appId, (ref) => followUp.matchesBotRef(groupKey, ref));
+            const openBefore = followUp.get(groupKey);
+
+            if (mentionedNow || quote.quotedBot) {
+              const trigger = keywordHit ? `keyword:${keywordHit}` : quote.quotedBot ? 'quote' : 'mention';
+              const turn = confirmFollowUpWindow(followUp, groupKey, trigger);
+              // 引用机器人但正文里没有 @：补 mention 才能过 mentionGate
+              if (!mentionedNow && quote.quotedBot) {
+                markMention(msg, { is_you: true, followUp: true });
+                ctx.state = ctx.state ?? {};
+                ctx.state.qqbotGuard = { followUp: true, quote: true };
+                logger.debug?.('[qqbot-guard] 引用了机器人 → 伪造 mentions.is_you，放行');
+              }
+              if (!openBefore) logger.info?.(`[qqbot-guard] 续聊窗口打开：群 ${groupKey}（${trigger}）`);
+              logger.debug?.(
+                `[qqbot-guard] 续聊窗口续期：${trigger} turns=${turn?.turns ?? 0}` +
+                  (turn?.closed ? '（达上限，关窗）' : ''),
+              );
+              rememberGroupMessage(followUp, groupKey, msg, raw);
+            } else if (openBefore) {
+              const text = typeof raw === 'string' ? raw.trim() : '';
+              if (!text) {
+                logger.debug?.('[qqbot-guard] 续聊窗口：空文本消息不判定');
+              } else if (/^\//.test(text)) {
+                // 斜杠命令归 qqbot 的 slashCommand 管；没 @ 时它本来也走不到，这里不替它开道。
+                logger.debug?.('[qqbot-guard] 续聊窗口：斜杠命令不判定');
+              } else {
+                // 先记一次到达：冷却期内直接不回（@/关键词走上面的快通道，不受影响）。
+                const floodState = flood ? flood.observe(groupKey) : null;
+                // 代次：刷屏触发冷却会 +1，排队中的旧消息看到代次变了就自己丢弃。
+                const floodEpoch = flood ? flood.epoch(groupKey) : 0;
+                const floodAction = current.followUpFloodAction === 'skip' ? 'skip' : 'select';
+                if (floodState?.flooding && floodAction === 'skip') {
+                  // 主动丢弃：不往下走，也不在函数末尾补一次 next()
+                  released = true;
+                  logger.debug?.(
+                    `[qqbot-guard] 刷屏保护：冷却中（约 ${Math.ceil(
+                      floodState.remainingMs / 1000,
+                    )} 秒），本条不回`,
+                  );
+                } else {
+                  const item = {
+                    text,
+                    sender: msg.senderName ?? '',
+                    quotedBot: quote.quotedBot,
+                    flooding: floodState?.flooding === true,
+                    at: Date.now(),
+                  };
+                  // 短时间内连着来好几条时只判一次；判定结果对这一批都生效。
+                  let outcome;
+                  if (burst && finiteNumber(current.followUpBurstMs, 0) > 0) {
+                    outcome = await burst.add(groupKey, item);
+                  } else {
+                    outcome = {
+                      batchId: null,
+                      count: 1,
+                      index: 1,
+                      verdict: null,
+                      selected: null,
+                      error: null,
+                    };
+                    try {
+                      const decision = await decideFollowUpBurst([item], groupKey);
+                      outcome.verdict = decision?.verdict === true ? true : decision?.verdict === false ? false : null;
+                      outcome.selected = Array.isArray(decision?.selected) ? decision.selected : null;
+                    } catch (err) {
+                      outcome.error = err;
+                    }
+                  }
+
+                  // 放行统一走按群串行队列：等上一条的 turn 收尾再 next()，
+                  // 这样 concurrencyGuard 不会把几条消息 merge 成一轮，能一条一条回。
+                  const release = async (trigger, extra = {}) => {
+                    // 先占位：下面若 next() 抛错，末尾也不能再 next 一次
+                    released = true;
+                    await turnQueue.run(groupKey, async () => {
+                      if (flood && flood.epoch(groupKey) !== floodEpoch) {
+                        logger.debug?.('[qqbot-guard] 刷屏代次已更新，排队中的旧消息丢弃');
+                        return;
+                      }
+                      if (!followUp.get(groupKey)) {
+                        logger.debug?.('[qqbot-guard] 续聊窗口已关闭，排队中的消息不再放行');
+                        return;
+                      }
+                      const turn = confirmFollowUpWindow(followUp, groupKey, trigger);
+                      markMention(msg, { is_you: true, followUp: true });
+                      ctx.state = ctx.state ?? {};
+                      ctx.state.qqbotGuard = { followUp: true, turns: turn?.turns ?? 0, ...extra };
+                      rememberGroupMessage(followUp, groupKey, msg, text);
+                      logger.debug?.(
+                        `[qqbot-guard] 续聊放行（${trigger}，批 ${outcome.count} 条）turns=${
+                          turn?.turns ?? 0
+                        }` + (turn?.closed ? '（达上限，关窗）' : ''),
+                      );
+                      await next();
+                    });
+                    released = true;
+                  };
+
+                  const policy = current.followUpOnJudgeError === 'reply' ? 'reply' : 'skip';
+                  if (outcome.verdict === true) {
+                    // select 模式：同一批里只回被挑中的那几条，其余静默。
+                    const picked = Array.isArray(outcome.selected) ? outcome.selected : null;
+                    const me = outcome.index ?? 1;
+                    if (picked && !picked.includes(me)) {
+                      // 没被挑中：静默丢弃，不交给下游
+                      released = true;
+                      logger.debug?.(
+                        `[qqbot-guard] 刷屏挑选：第 ${me}/${outcome.count} 条未被选中，不回`,
+                      );
+                    } else {
+                      await release('judge');
+                    }
+                  } else if (outcome.verdict === false) {
+                    logger.debug?.(
+                      `[qqbot-guard] 续聊判定=无关（批 ${outcome.count} 条），交给 mentionGate 拦停`,
+                    );
+                  } else {
+                    const win = followUp.get(groupKey);
+                    // 同一批只记一次失败：否则 5 条消息同时失败会瞬间凑满 3 次、把窗口关掉。
+                    const firstOfBatch = !outcome.batchId || win?.lastFailureBatch !== outcome.batchId;
+                    if (win && firstOfBatch) {
+                      win.lastFailureBatch = outcome.batchId;
+                      win.failures = (win.failures ?? 0) + 1;
+                      logger.warn?.(
+                        `[qqbot-guard] 续聊判定失败（第 ${win.failures} 次，按 ${policy} 处理）：${
+                          outcome.error?.message ?? outcome.error
+                        }`,
+                      );
+                      if (win.failures >= 3) {
+                        followUp.close(groupKey);
+                        logger.warn?.(
+                          '[qqbot-guard] 续聊判定连续失败 3 次，已关闭该群窗口（@ 或关键词可重新唤醒）',
+                        );
+                      }
+                    }
+                    if (policy === 'reply' && followUp.get(groupKey)) {
+                      await release('judge-error', { error: true });
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
       }
     } catch (err) {
       // 门禁本身绝不把消息链路带崩
       logger.error?.(`[qqbot-guard] guard 异常（已忽略）: ${err?.message ?? err}`);
     }
-    await next();
+    if (!released) await next();
   };
 }
 
@@ -945,6 +1951,21 @@ export function patchHistoryStore(store, notes, logger = console, options = {}) 
  * @param {object} log logger
  * @returns {((attachments: Array) => Promise<Map<string, string>>) | null}
  */
+/**
+ * qqbot 发布产物目录：0.5.x 发的是 `lib/`，早期文档/版本写 `dist/`。
+ * 先看有没有网关入口，避免同名空目录骗过判断；都没有就退回文档里的旧值。
+ * @param {string} qqbotDir dsh-qqbot 包目录
+ */
+export function qqbotSourceDir(qqbotDir) {
+  for (const dir of ['lib', 'dist']) {
+    if (existsSync(join(qqbotDir, dir, 'gateway', 'middleware-setup.js'))) return dir;
+  }
+  for (const dir of ['lib', 'dist']) {
+    if (existsSync(join(qqbotDir, dir))) return dir;
+  }
+  return 'dist';
+}
+
 function makeMediaDownloader(qqbotDir, cfg, log) {
   if (cfg.historyMedia === false) return null;
   let impl = null;
@@ -953,7 +1974,9 @@ function makeMediaDownloader(qqbotDir, cfg, log) {
     if (!impl) {
       try {
         const mod = await import(
-          pathToFileURL(join(qqbotDir, 'dist', 'transport', 'attachment.js')).href
+          pathToFileURL(
+            join(qqbotDir, qqbotSourceDir(qqbotDir), 'transport', 'attachment.js'),
+          ).href
         );
         impl = typeof mod.downloadMediaAttachments === 'function' ? mod.downloadMediaAttachments : null;
       } catch (err) {
@@ -1013,6 +2036,98 @@ export function installGuard(QQBot, guard, logger = console) {
       }
     },
   };
+}
+
+const OUTBOUND_FLAG = Symbol.for('qqbot-guard.sendMarkdown');
+
+/**
+ * 旁路记录机器人自己发出的文字，供续聊判定当上下文。
+ *
+ * qqbot 的群历史只记入站消息（historyBuffer 在门控前），机器人说过的话在判定时不可见；
+ * 这里包一层 `QQBot.prototype.sendMarkdown`，把发出的片段连同 `ext_info.ref_idx` 记进窗口。
+ * 只读侧：不改参数、不改返回值，失败一律吞掉——记录失败最多让判定变笨，不能影响发消息。
+ *
+ * 另外当 `followUpQuoteReply` 打开时，群聊回复改走 `send()` 并带上 `message_reference`，
+ * 让 QQ 显示引用框；引用发送失败会退回原来的 `sendMarkdown`，不会把消息弄丢。
+ *
+ * @param {Function} QQBot @tencent-connect/qqbot-nodejs 的 QQBot 类
+ * @param {object} followUp createFollowUpState() 实例
+ * @param {object} [logger]
+ * @param {object} [options]
+ * @param {() => object} [options.readConfig] 实时配置读取（每次发送都重新判断是否带引用）
+ * @param {number} [options.markdownType] QQ 的 msg_type，默认 2（markdown）
+ * @returns {{ installed: boolean, restored?: () => void, reason?: string }}
+ */
+export function installOutboundRecorder(QQBot, followUp, logger = console, options = {}) {
+  if (typeof QQBot?.prototype?.sendMarkdown !== 'function') {
+    return { installed: false, reason: 'QQBot.prototype.sendMarkdown 不存在，版本可能已变' };
+  }
+  const readConfig = typeof options.readConfig === 'function' ? options.readConfig : null;
+  const markdownType = options.markdownType ?? 2;
+  const current = QQBot.prototype.sendMarkdown;
+  if (current?.[OUTBOUND_FLAG]) {
+    // 热重载时换用新的窗口实例与配置来源，保留原来的补丁/还原函数
+    current[OUTBOUND_FLAG].followUp = followUp;
+    current[OUTBOUND_FLAG].readConfig = readConfig;
+    current[OUTBOUND_FLAG].markdownType = markdownType;
+    return { installed: true, restored: current[OUTBOUND_FLAG].restore, reason: 'already-patched' };
+  }
+
+  const original = current;
+  const state = { followUp, readConfig, markdownType, original, restore: null };
+  const patched = async function sendMarkdown(target, content, ...rest) {
+    const live = patched[OUTBOUND_FLAG];
+    const opts = rest[0];
+    const quote =
+      target?.scope === 'group' &&
+      target?.msgId &&
+      live?.readConfig?.()?.followUpQuoteReply === true &&
+      typeof this.send === 'function';
+    let response;
+    if (quote) {
+      try {
+        response = await this.send({
+          target,
+          msgType: live?.markdownType ?? 2,
+          markdown: { content },
+          keyboard: opts?.keyboard,
+          messageReference: { message_id: String(target.msgId) },
+        });
+      } catch (err) {
+        // 引用只是体验增强：平台不接受就退回普通发送，不能因此把回复丢了
+        logger.warn?.(`[qqbot-guard] 带引用发送失败，已退回普通发送: ${err?.message ?? err}`);
+        response = await original.call(this, target, content, ...rest);
+      }
+    } else {
+      response = await original.call(this, target, content, ...rest);
+    }
+    try {
+      const groupKey = target?.scope === 'group' ? String(target?.targetId ?? '') : '';
+      const text = typeof content === 'string' ? content : '';
+      if (live?.followUp && groupKey && text) {
+        const refIdx = response?.ext_info?.ref_idx;
+        live.followUp.remember(groupKey, {
+          role: 'bot',
+          name: '机器人',
+          text,
+          at: Date.now(),
+          refIdx: refIdx === undefined || refIdx === null ? '' : String(refIdx),
+        });
+      }
+    } catch (err) {
+      logger.debug?.(`[qqbot-guard] 记录机器人发言失败: ${err?.message ?? err}`);
+    }
+    return response;
+  };
+  state.restore = () => {
+    if (QQBot.prototype.sendMarkdown === patched) {
+      QQBot.prototype.sendMarkdown = original;
+    }
+  };
+  patched[OUTBOUND_FLAG] = state;
+  QQBot.prototype.sendMarkdown = patched;
+
+  return { installed: true, restored: state.restore };
 }
 
 // ────────────────────────── cordis 插件入口 ──────────────────────────
@@ -1084,7 +2199,41 @@ export async function apply(ctx, config) {
 
   const notes = new Map();
   const mediaDownloader = makeMediaDownloader(qqbot.dir, cfg, log);
-  const guard = createGuard(() => source.get(), log, notes, mediaDownloader);
+
+  // 续聊窗口：窗口时长与条数上限都按当前配置实时取，设置页改完不用重启。
+  const followUp = createFollowUpState({
+    windowMs: () => {
+      const minutes = Number(source.get()?.followUpWindowMinutes);
+      const safe = Number.isFinite(minutes) && minutes > 0 ? minutes : 10;
+      return Math.max(1, Math.min(1440, safe)) * 60 * 1000;
+    },
+    maxTurns: () => {
+      const turns = Number(source.get()?.followUpMaxTurns);
+      return Number.isFinite(turns) && turns > 0 ? Math.min(1000, Math.trunc(turns)) : 0;
+    },
+  });
+  const getLlm = () => {
+    try {
+      return ctx?.get?.('llm') ?? null;
+    } catch {
+      return null;
+    }
+  };
+  const getRoute = () => {
+    try {
+      const selection = ctx?.get?.('agentDefaultModel')?.currentSelection?.();
+      if (!selection?.provider || !selection?.model) return null;
+      return { provider: selection.provider, model: selection.model };
+    } catch {
+      return null;
+    }
+  };
+
+  const guard = createGuard(() => source.get(), log, notes, mediaDownloader, {
+    followUp,
+    getLlm,
+    getRoute,
+  });
   const result = installGuard(sdk.QQBot, guard, log);
   if (!result.installed) {
     status.reason = `补丁未安装：${result.reason}`;
@@ -1094,18 +2243,30 @@ export async function apply(ctx, config) {
   status.installed = true;
   status.sdk = sdkInfo.version ?? '';
 
+  // 机器人发言记录：给续聊判定补上「自己刚说过什么」。
+  const outbound = installOutboundRecorder(sdk.QQBot, followUp, log, {
+    readConfig: () => source.get(),
+    markdownType: sdk.MsgType?.MARKDOWN ?? 2,
+  });
+  if (!outbound.installed) log.warn(`[qqbot-guard] 出站记录未启用：${outbound.reason}`);
+  Object.defineProperty(status, 'followUpWindows', {
+    enumerable: true,
+    get: () => followUp.size(),
+  });
+
   let historyPatched = false;
   let mediaRoot = '';
   if (cfg.historyAttachments !== false) {
     try {
+      const sourceDir = qqbotSourceDir(qqbot.dir);
       const storeMod = await import(
-        pathToFileURL(join(qqbot.dir, 'dist', 'features', 'history-store.js')).href
+        pathToFileURL(join(qqbot.dir, sourceDir, 'features', 'history-store.js')).href
       );
       // 附件落盘的目录：上游从 media-cleaner 导出 MEDIA_ROOT（~/.dsh-qqbot/media），
       // 拿不到就按同一个默认值兜底（路径标注是锦上添花，失败不影响摘要）。
       try {
         const mediaMod = await import(
-          pathToFileURL(join(qqbot.dir, 'dist', 'media', 'media-cleaner.js')).href
+          pathToFileURL(join(qqbot.dir, sourceDir, 'media', 'media-cleaner.js')).href
         );
         mediaRoot = typeof mediaMod.MEDIA_ROOT === 'string' ? mediaMod.MEDIA_ROOT : '';
       } catch {
@@ -1121,17 +2282,29 @@ export async function apply(ctx, config) {
 
   if (cfg.verbose) {
     const cfgFile = resolveConfigFile(cfg);
+    const route = getRoute();
     log.info(
       `[qqbot-guard] 就绪：qqbot=${qqbot.pkg?.version ?? '?'} sdk=${sdkInfo.version ?? '?'} ` +
         `triggers=${JSON.stringify(cfg.triggers)} 配置源=${existsSync(cfgFile ?? '') ? cfgFile : 'cordis/默认'} ` +
         `表情=${cfg.faces !== false ? '开' : '关'} 历史附件=${historyPatched ? '开' : '关'} ` +
+        `续聊=${cfg.followUpEnabled === false ? '关' : `${cfg.followUpWindowMinutes ?? 10}分钟/上限${cfg.followUpMaxTurns || '不限'}`} ` +
+        `引用=${cfg.followUpQuoteReply === true ? '开' : '关'} ` +
+        `判定模型=${cfg.followUpJudgeProvider ? `${cfg.followUpJudgeProvider}/${cfg.followUpJudgeModel || '?'}` : route ? `${route.provider}/${route.model}（宿主）` : '无'} ` +
         `注入方式=lazy-unshift + 伪造 mentions（与加载顺序无关）`,
     );
   }
 
-  if (result.restored && typeof ctx?.on === 'function') {
+  const restores = [result.restored, outbound.restored].filter((fn) => typeof fn === 'function');
+  if (restores.length > 0 && typeof ctx?.on === 'function') {
     ctx.on('dispose', () => {
-      result.restored();
+      for (const restore of restores) {
+        try {
+          restore();
+        } catch (err) {
+          log.warn(`[qqbot-guard] 卸载补丁失败: ${err?.message ?? err}`);
+        }
+      }
+      followUp.clear();
       log.info('[qqbot-guard] 已卸载补丁');
     });
   }

@@ -42,5 +42,16 @@ jobs:
             exit 1
           fi
 
+      # 重打 tag / 重跑流水线时幂等：该版本已经发过就跳过，不把构建标红。
+      - name: Already published?
+        id: published
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          if npm view "dsh-qqbot-guard@$version" version >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "dsh-qqbot-guard@$version 已存在，跳过发布"
+          fi
+
       - name: Publish
+        if: steps.published.outputs.skip != 'true'
         run: npm publish --access public

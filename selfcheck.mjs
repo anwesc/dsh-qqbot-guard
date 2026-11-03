@@ -19,6 +19,7 @@ import {
   createGuard,
   patchHistoryStore,
   normalizeFaces,
+  qqbotSourceDir,
   summarizeAttachments,
 } from './index.js';
 
@@ -43,10 +44,10 @@ if (typeof sdk.QQBot?.prototype?.handleInboundMessage !== 'function') {
 }
 
 const setupMod = await import(
-  pathToFileURL(join(qqbot.dir, 'dist', 'gateway', 'middleware-setup.js')).href
+  pathToFileURL(join(qqbot.dir, qqbotSourceDir(qqbot.dir), 'gateway', 'middleware-setup.js')).href
 );
 const storeMod = await import(
-  pathToFileURL(join(qqbot.dir, 'dist', 'features', 'history-store.js')).href
+  pathToFileURL(join(qqbot.dir, qqbotSourceDir(qqbot.dir), 'features', 'history-store.js')).href
 );
 
 const APP = '102000000';
