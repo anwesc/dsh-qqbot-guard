@@ -1,0 +1,14 @@
+Sticker images bundled with dsh-qqbot-guard
+===========================================
+
+Whale maid (whale-chan/*.png)
+  Fan art of the "whale girl" character (base character: 上善无形,
+  DeepSeek maid design: ZipZipPipe), personal non-commercial use only.
+  License: CC BY-NC-SA 4.0 (https://creativecommons.org/licenses/by-nc-sa/4.0/)
+  NOT covered by the project MIT license. Do not use commercially.
+  Delete `assets/stickers/whale-chan/` (or turn off followUpStickerEnabled)
+  for commercial use, or point `followUpStickerDir` at your own folder.
+  See `whale-chan/NOTICE.txt` for full attribution.
+
+You can replace the built-in set entirely by pointing `followUpStickerDir`
+at your own folder (png / jpg / jpeg / gif / webp).

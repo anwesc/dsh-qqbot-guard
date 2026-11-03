@@ -1,13 +1,19 @@
 /**
  * qqbot-guard 的客户端半侧：在 DSH「设置」里加一个「QQ 守护」板块。
  *
+ * 布局思路（移动端优先）：
+ * - 每个分组是一张可折叠卡片，标题下面带一行「当前值摘要」，收起时也知道里面是什么；
+ * - 开关和数字用紧凑行（说明在左、控件在右），短数字两列并排，不再一项占一大块；
+ * - 关键词、下拉、路径这类需要横向空间的内容才整行铺开；
+ * - 顶部一条运行状态，底部粘一条保存栏，随时能看到「有未保存的改动」。
+ *
  * 手写、不打包：DSH 的模块加载器按约定加载 `client.js`（package.json 的 `exports["./client"]`），
  * 内容就是 `window.__ModuleLoader__.load({ id, factory })` 包一层 CJS 工厂；
  * React 由宿主通过 `require('react')` 提供，所以这里不需要 node_modules。
  *
  * 数据全部走宿主同源的 `/qqbot-guard/config`（服务端在 index.js 的 installConfigApi 里注册），
  * 保存后 guard 端会按文件 mtime 热重载，下一条群消息就生效；只有「总开关」与附件下载相关
- * 的项需要重启插件才生效，UI 上会单独提示。
+ * 的项需要重启插件才生效，UI 上会单独标「需重启」。
  */
 window.__ModuleLoader__.load({
   id: 'dsh-qqbot-guard',
@@ -18,6 +24,7 @@ window.__ModuleLoader__.load({
 
     const NS = 'qqbot-guard';
     const API = '/qqbot-guard/config';
+    const OPEN_KEY = 'dsh-qqbot-guard:open-cards';
 
     const zh = {
       nav: 'QQ 守护',
@@ -37,18 +44,72 @@ window.__ModuleLoader__.load({
       ignoreCase: '忽略大小写',
       verbose: '诊断日志',
       followUp: '续聊窗口',
+      groupBurst: '批量与回复',
+      groupSticker: '附和表情',
+      groupFlood: '刷屏保护',
+      groupJudge: '判定模型与失败策略',
+      cardWake: '唤醒与开关',
+      cardHandling: '消息处理',
+      restartTag: '需重启',
+      summaryOn: '已开启',
+      summaryOff: '已关闭',
+      keywordUnit: '个关键词',
+      expandAll: '展开全部',
+      collapseAll: '收起全部',
+      dirty: '有未保存的改动',
+      upToDate: '已是最新',
+      quoteShort: '引用',
+      ackShortRenew: '只续期',
+      ackShortReply: '照常回',
+      ackShortIgnore: '忽略',
+      replyShortAuto: '自动判断',
+      replyShortBatch: '合并回复',
+      replyShortEach: '逐条回复',
+      floodShortSelect: '只回相关',
+      floodShortSkip: '整段不回',
+      judgeShortSkip: '失败不回',
+      judgeShortReply: '失败照回',
+      unitMinutes: '分钟',
+      unitSeconds: '秒',
+      unitMessages: '条',
+      summaryPerBatch: '每批',
+      summaryMaxWait: '最长等',
+      summaryCooldown: '冷却',
+      autoDetect: '自动探测',
       followUpHint:
         '关键词或 @ 唤醒后，群里没 @ 的消息也会先问一次小模型「还是同一个话题吗」：是就继续回，不是就不吭声。超过设定时间没有相关消息就休眠。',
       followUpEnabled: '启用续聊',
       followUpEnabledHint: '关掉后只有关键词和 @ 能唤醒。',
       followUpQuoteReply: '回复时带引用框',
-      followUpQuoteReplyHint: '引用被回复的那条消息，方便看上下文；平台对「被动回复 + 引用」的支持需要先试一条。',
+      followUpQuoteReplyHint:
+        '引用被回复的那条消息，方便看上下文。合并回复默认不带引用框，逐条回复才会挂。',
+      followUpReplyMode: '回复形态',
+      followUpReplyModeHint:
+        'auto 让模型判断：同一话题能一条讲完就合并成一条，讲不完再逐条；拿不准按逐条。',
+      followUpReplyModeAuto: '自动判断（auto）',
+      followUpReplyModeBatch: '总是合并（batch）',
+      followUpReplyModeEach: '总是逐条（each）',
+      followUpAckMode: '笑声/附和怎么处理',
+      followUpAckModeHint: '「哈哈哈」「收到」这类不单独回，只把窗口续上；想让它们也回就改成 reply。',
+      followUpAckRenew: '只续期（renew）',
+      followUpAckReply: '照常判定回复（reply）',
+      followUpAckIgnore: '完全忽略（ignore）',
+      followUpAckFastPath: '短附和直接续期，不调判定',
+      followUpAckFastPathHint: '纯笑声、+1、表情这类不花模型调用；不确定时关掉。',
+      followUpSticker: '附和时发一张表情',
+      followUpStickerHint: '判定为「哈哈哈/收到」这类附和时，只发一张内置表情代替冷场；只发表情，不回文本。',
+      followUpStickerCooldown: '同群表情最小间隔（毫秒）',
+      followUpStickerDir: '自定义表情目录',
+      followUpStickerDirHint: '留空用内置的 9 张鲸鱼娘（同人二创，仅限个人非商业）；也可以填自己的 png/jpg/gif/webp 目录。',
+      followUpStickerDirPlaceholder: '留空 = 内置表情',
       followUpWindow: '静默休眠（分钟）',
       followUpWindowHint: '这段时间里没有相关消息就关窗；再想聊得重新 @ 或发关键词。',
       followUpBurst: '批量汇总窗口（毫秒）',
       followUpBurstHint:
-        '这段时间内连着发的消息合并成一次判定，省 token；判定通过后仍逐条分别回复。0 表示不合并。',
+        '这段时间内连着发的消息合并成一次判定，省 token；判定还会给出「合并成一条」还是「逐条回」。0 表示不合并。',
       followUpBurstMax: '每批最多合并（条）',
+      followUpBurstMaxWait: '最长等待（毫秒）',
+      followUpBurstMaxWaitHint: '群里一直说话时，从第一条起最多等这么久就结算',
       followUpFlood: '刷屏保护',
       followUpFloodHint:
         '短时间消息太多时不再逐条判定，避免排队越拖越长、回复全是过期的。@ 和关键词不受影响。',
@@ -107,20 +168,73 @@ window.__ModuleLoader__.load({
       historyMediaHint: 'Download media for messages that never triggered a keyword.',
       ignoreCase: 'Ignore case',
       verbose: 'Diagnostic logs',
-      followUp: 'Follow-up window',
+      groupBurst: 'Batching & replies',
+      groupSticker: 'Reaction stickers',
+      groupFlood: 'Flood protection',
+      groupJudge: 'Judge model & failures',
+      cardWake: 'Wake-up & keywords',
+      cardHandling: 'Message handling',
+      restartTag: 'restart',
+      summaryOn: 'On',
+      summaryOff: 'Off',
+      keywordUnit: 'keywords',
+      expandAll: 'Expand all',
+      collapseAll: 'Collapse all',
+      dirty: 'Unsaved changes',
+      upToDate: 'Up to date',
+      quoteShort: 'quote',
+      ackShortRenew: 'renew only',
+      ackShortReply: 'reply',
+      ackShortIgnore: 'ignore',
+      replyShortAuto: 'auto',
+      replyShortBatch: 'combined',
+      replyShortEach: 'separate',
+      floodShortSelect: 'related only',
+      floodShortSkip: 'silent',
+      judgeShortSkip: 'stay quiet',
+      judgeShortReply: 'reply anyway',
+      unitMinutes: 'min',
+      unitSeconds: 's',
+      unitMessages: 'msgs',
+      summaryPerBatch: 'per batch',
+      summaryMaxWait: 'wait max',
+      summaryCooldown: 'cooldown',
+      autoDetect: 'auto-detect',
       followUpHint:
         'After a keyword or @ wakes the bot, un-mentioned group messages are checked once with a small model: same topic → keep replying, otherwise stay quiet. The window sleeps after the configured silence.',
       followUpEnabled: 'Enable follow-up',
       followUpEnabledHint: 'When off, only keywords and @ can wake the bot.',
       followUpQuoteReply: 'Quote the message being replied to',
       followUpQuoteReplyHint:
-        'Show a quote block for the message being answered; platform support for passive reply + quote needs one live test.',
+        'Quote the message being answered for context. Combined batch replies omit the quote block.',
+      followUpReplyMode: 'Reply shape',
+      followUpReplyModeHint:
+        'auto lets the judge decide: one combined reply when it can cover the batch, otherwise one per message; unsure means separate.',
+      followUpReplyModeAuto: 'Auto',
+      followUpReplyModeBatch: 'Always combine (batch)',
+      followUpReplyModeEach: 'Always separate (each)',
+      followUpAckMode: 'Laughter / acknowledgements',
+      followUpAckModeHint:
+        'Short reactions like “haha” or “got it” renew the window without a reply; switch to reply to answer them too.',
+      followUpAckRenew: 'Renew only (renew)',
+      followUpAckReply: 'Judge and reply (reply)',
+      followUpAckIgnore: 'Ignore (ignore)',
+      followUpAckFastPath: 'Renew short reactions without judging',
+      followUpAckFastPathHint: 'Pure laughter, +1 or emoji skip the model call; turn off if unsure.',
+      followUpSticker: 'Send a sticker for short reactions',
+      followUpStickerHint: 'When the scene is just laughter or acknowledgement, send one built-in sticker instead of text.',
+      followUpStickerCooldown: 'Sticker cooldown per group (ms)',
+      followUpStickerDir: 'Custom sticker folder',
+      followUpStickerDirHint: 'Leave empty for the 9 built-in whale-maid stickers (fan art, personal non-commercial use only), or point at your own png/jpg/gif/webp folder.',
+      followUpStickerDirPlaceholder: 'Empty = built-in stickers',
       followUpWindow: 'Sleep after silence (minutes)',
       followUpWindowHint: 'No related message for this long closes the window; wake it again with @ or a keyword.',
       followUpBurst: 'Batch window (ms)',
       followUpBurstHint:
-        'Messages arriving within this window are judged together to save tokens; each is still replied to separately. 0 disables batching.',
+        'Messages arriving within this window are judged together to save tokens; the judge also decides whether to send one combined reply or separate replies. 0 disables batching.',
       followUpBurstMax: 'Max messages per batch',
+      followUpBurstMaxWait: 'Max wait (ms)',
+      followUpBurstMaxWaitHint: 'During continuous chat, settle at most this long after the first message',
       followUpFlood: 'Flood protection',
       followUpFloodHint:
         'During a burst, stop judging every message so the queue cannot grow and replies cannot go stale. @ mentions and keywords still work.',
@@ -162,36 +276,137 @@ window.__ModuleLoader__.load({
       file: 'Config file',
     };
 
+    const BORDER = 'var(--dsh-border, rgba(127,127,127,.28))';
+    const ACCENT = 'var(--dsh-accent, #4c6ef5)';
+    const MONO = 'ui-monospace, SFMono-Regular, Menlo, monospace';
+    const SURFACE = 'var(--dsh-surface, transparent)';
+
     const S = {
-      root: { display: 'flex', flexDirection: 'column', gap: 18, padding: '4px 2px 28px' },
+      root: { display: 'flex', flexDirection: 'column', gap: 14, padding: '2px 2px 6px' },
       intro: { margin: 0, fontSize: 13, lineHeight: 1.7, opacity: 0.86 },
-      card: {
-        border: '1px solid var(--dsh-border, rgba(127,127,127,.28))',
-        borderRadius: 12,
-        padding: '14px 16px',
+
+      statusStrip: {
         display: 'flex',
         flexDirection: 'column',
+        gap: 6,
+        padding: '10px 12px',
+        borderRadius: 12,
+        background: 'rgba(127,127,127,.07)',
+      },
+      statusRow: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' },
+      pathLine: {
+        margin: 0,
+        fontSize: 11.5,
+        lineHeight: 1.5,
+        opacity: 0.6,
+        fontFamily: MONO,
+        wordBreak: 'break-all',
+      },
+      badge: {
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 6,
+        padding: '2px 9px',
+        borderRadius: 999,
+        fontSize: 12,
+        border: `1px solid ${BORDER}`,
+        opacity: 0.9,
+        whiteSpace: 'nowrap',
+      },
+
+      toolbar: { display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 2 },
+      linkButton: {
+        border: 0,
+        background: 'transparent',
+        color: 'inherit',
+        font: 'inherit',
+        fontSize: 12,
+        opacity: 0.6,
+        cursor: 'pointer',
+        padding: '2px 4px',
+      },
+
+      card: { border: `1px solid ${BORDER}`, borderRadius: 14, overflow: 'hidden' },
+      cardHeader: {
+        display: 'flex',
+        alignItems: 'center',
+        gap: 10,
+        width: '100%',
+        padding: '12px 14px',
+        border: 0,
+        background: 'transparent',
+        color: 'inherit',
+        font: 'inherit',
+        textAlign: 'left',
+        cursor: 'pointer',
+      },
+      cardHeaderText: { display: 'flex', flexDirection: 'column', gap: 2, flex: '1 1 auto', minWidth: 0 },
+      cardTitle: { fontSize: 13.5, fontWeight: 700 },
+      cardSummary: {
+        fontSize: 11.5,
+        opacity: 0.55,
+        whiteSpace: 'nowrap',
+        overflow: 'hidden',
+        textOverflow: 'ellipsis',
+      },
+      chevron: {
+        flex: '0 0 auto',
+        width: 7,
+        height: 7,
+        marginTop: -3,
+        marginRight: 2,
+        borderRight: '1.6px solid currentColor',
+        borderBottom: '1.6px solid currentColor',
+        opacity: 0.4,
+        transition: 'transform .18s ease, opacity .18s ease',
+      },
+      cardBody: { display: 'flex', flexDirection: 'column', gap: 14, padding: '2px 14px 14px' },
+
+      row: {
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        gap: 12,
+        padding: '2px 0',
+      },
+      rowText: { display: 'flex', flexDirection: 'column', gap: 3, minWidth: 0 },
+      control: { display: 'flex', alignItems: 'center', gap: 8, flex: '0 0 auto' },
+      labelLine: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' },
+      label: { fontSize: 13, fontWeight: 600 },
+      hint: { margin: 0, fontSize: 12, lineHeight: 1.55, opacity: 0.66 },
+      tag: {
+        fontSize: 10.5,
+        lineHeight: 1.4,
+        padding: '1px 6px',
+        borderRadius: 6,
+        border: `1px dashed ${BORDER}`,
+        opacity: 0.6,
+        whiteSpace: 'nowrap',
+      },
+      chip: {
+        display: 'inline-flex',
+        alignItems: 'center',
+        padding: '1px 8px',
+        borderRadius: 999,
+        fontSize: 11.5,
+        background: 'rgba(127,127,127,.12)',
+        opacity: 0.85,
+      },
+
+      field: { display: 'flex', flexDirection: 'column', gap: 6 },
+      grid: {
+        display: 'grid',
+        gridTemplateColumns: 'repeat(auto-fit, minmax(148px, 1fr))',
         gap: 12,
       },
-      cardTitle: {
-        fontSize: 12,
-        fontWeight: 600,
-        letterSpacing: '.08em',
-        textTransform: 'uppercase',
-        opacity: 0.62,
-        margin: 0,
-      },
-      field: { display: 'flex', flexDirection: 'column', gap: 6 },
-      label: { fontSize: 13, fontWeight: 600 },
-      hint: { fontSize: 12, lineHeight: 1.6, opacity: 0.68, margin: 0 },
       textarea: {
         width: '100%',
-        minHeight: 96,
+        minHeight: 88,
         boxSizing: 'border-box',
         padding: '10px 12px',
         borderRadius: 10,
-        border: '1px solid var(--dsh-border, rgba(127,127,127,.32))',
-        background: 'var(--dsh-surface, transparent)',
+        border: `1px solid ${BORDER}`,
+        background: SURFACE,
         color: 'inherit',
         font: 'inherit',
         fontSize: 13,
@@ -201,94 +416,385 @@ window.__ModuleLoader__.load({
       input: {
         width: '100%',
         boxSizing: 'border-box',
-        padding: '8px 12px',
+        height: 36,
+        padding: '0 12px',
         borderRadius: 10,
-        border: '1px solid var(--dsh-border, rgba(127,127,127,.32))',
-        background: 'var(--dsh-surface, transparent)',
+        border: `1px solid ${BORDER}`,
+        background: SURFACE,
         color: 'inherit',
         font: 'inherit',
         fontSize: 13,
       },
-      row: {
+      select: {
+        width: '100%',
+        boxSizing: 'border-box',
+        height: 36,
+        padding: '0 34px 0 10px',
+        borderRadius: 10,
+        border: `1px solid ${BORDER}`,
+        background: SURFACE,
+        backgroundImage:
+          "url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5 6 6.5 11 1.5' fill='none' stroke='%23888a8f' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E\")",
+        backgroundRepeat: 'no-repeat',
+        backgroundPosition: 'right 12px center',
+        backgroundSize: '11px 8px',
+        color: 'inherit',
+        font: 'inherit',
+        fontSize: 13,
+        appearance: 'none',
+        WebkitAppearance: 'none',
+        cursor: 'pointer',
+      },
+      numberInput: {
+        width: 96,
+        boxSizing: 'border-box',
+        height: 34,
+        padding: '0 10px',
+        borderRadius: 9,
+        border: `1px solid ${BORDER}`,
+        background: SURFACE,
+        color: 'inherit',
+        font: 'inherit',
+        fontSize: 13,
+      },
+
+      footer: {
+        position: 'sticky',
+        bottom: 0,
+        zIndex: 5,
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'space-between',
-        gap: 12,
-        padding: '6px 0',
-        borderTop: '1px solid var(--dsh-border, rgba(127,127,127,.16))',
+        gap: 10,
+        flexWrap: 'wrap',
+        padding: '10px 2px',
+        borderTop: `1px solid ${BORDER}`,
+        background: 'var(--dsh-surface, Canvas)',
+        backdropFilter: 'blur(8px)',
       },
-      rowText: { display: 'flex', flexDirection: 'column', gap: 2 },
-      switchWrap: { display: 'flex', alignItems: 'center', gap: 8, flex: '0 0 auto' },
-      footer: { display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' },
+      footerState: { display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0, flex: '1 1 auto' },
+      footerActions: { display: 'flex', alignItems: 'center', gap: 8, flex: '0 0 auto' },
       button: {
         padding: '8px 18px',
         borderRadius: 10,
-        border: '1px solid var(--dsh-border, rgba(127,127,127,.32))',
-        background: 'var(--dsh-accent, #4c6ef5)',
+        border: `1px solid ${BORDER}`,
+        background: ACCENT,
         color: '#fff',
         font: 'inherit',
         fontSize: 13,
         fontWeight: 600,
         cursor: 'pointer',
       },
+      buttonDisabled: {
+        background: 'rgba(127,127,127,.16)',
+        borderColor: BORDER,
+        color: 'inherit',
+        opacity: 0.75,
+        cursor: 'default',
+      },
       buttonGhost: {
         padding: '8px 14px',
         borderRadius: 10,
-        border: '1px solid var(--dsh-border, rgba(127,127,127,.32))',
+        border: `1px solid ${BORDER}`,
         background: 'transparent',
         color: 'inherit',
         font: 'inherit',
         fontSize: 13,
         cursor: 'pointer',
       },
-      badge: {
-        display: 'inline-flex',
-        alignItems: 'center',
-        gap: 6,
-        padding: '2px 9px',
-        borderRadius: 999,
-        fontSize: 12,
-        border: '1px solid var(--dsh-border, rgba(127,127,127,.32))',
-        opacity: 0.9,
-      },
       notice: { fontSize: 12.5, lineHeight: 1.6, margin: 0 },
-      mono: { fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12, wordBreak: 'break-all' },
+      mono: { fontFamily: MONO, fontSize: 12, wordBreak: 'break-all' },
     };
 
-    const TOGGLE_ROWS = [
-      ['faces', 'faces', 'facesHint', false],
-      ['historyAttachments', 'historyAttachments', 'historyAttachmentsHint', false],
-      ['historyMedia', 'historyMedia', 'historyMediaHint', true],
-      ['ignoreCase', 'ignoreCase', null, false],
-      ['verbose', 'verbose', null, false],
+    /** 哪些字段属于布尔值 / 数值 / 字符串，保存时按这个顺序拼 body（保证脏检查稳定）。 */
+    const BOOL_KEYS = [
+      'enabled',
+      'ignoreCase',
+      'faces',
+      'historyAttachments',
+      'historyMedia',
+      'verbose',
+      'strictVersion',
+      'followUpEnabled',
+      'followUpQuoteReply',
+      'followUpAckFastPath',
+      'followUpStickerEnabled',
+    ];
+    const NUM_KEYS = [
+      'historyMediaMaxMB',
+      'followUpWindowMinutes',
+      'followUpBurstMs',
+      'followUpBurstMax',
+      'followUpBurstMaxWaitMs',
+      'followUpMaxTurns',
+      'followUpJudgeTimeoutMs',
+      'followUpFloodWindowMs',
+      'followUpFloodMax',
+      'followUpFloodCooldownMs',
+      'followUpSelectMin',
+      'followUpStickerCooldownMs',
+    ];
+    const STR_KEYS = [
+      'followUpReplyMode',
+      'followUpAckMode',
+      'followUpFloodAction',
+      'followUpOnJudgeError',
+      'followUpJudgeProvider',
+      'followUpJudgeModel',
+      'followUpStickerDir',
+      'qqbotPackage',
     ];
 
-    function Toggle({ id, checked, onChange, disabled }) {
-      return h('input', {
-        id,
-        type: 'checkbox',
-        checked,
-        disabled,
-        onChange: (event) => onChange(event.target.checked),
-        style: { width: 16, height: 16, cursor: disabled ? 'default' : 'pointer' },
-      });
+    const HANDLING_TOGGLES = [
+      ['faces', 'facesHint', false],
+      ['historyAttachments', 'historyAttachmentsHint', false],
+      ['historyMedia', 'historyMediaHint', true],
+      ['ignoreCase', null, false],
+      ['verbose', null, false],
+    ];
+
+    const REPLY_SHORT = { auto: 'replyShortAuto', batch: 'replyShortBatch', each: 'replyShortEach' };
+    const ACK_SHORT = { renew: 'ackShortRenew', reply: 'ackShortReply', ignore: 'ackShortIgnore' };
+    const FLOOD_SHORT = { select: 'floodShortSelect', skip: 'floodShortSkip' };
+
+    const DEFAULT_OPEN = {
+      wake: true,
+      handling: false,
+      follow: true,
+      sticker: false,
+      burst: false,
+      flood: false,
+      judge: false,
+      advanced: false,
+    };
+
+    function parseKeywords(text) {
+      return String(text ?? '')
+        .split(/\r?\n|,|，/)
+        .map((s) => s.trim())
+        .filter(Boolean);
     }
 
-    function NumberField({ id, label, hint, value, min, max, onChange }) {
+    function buildBody(config, keywords) {
+      const cfg = config ?? {};
+      const body = { triggers: parseKeywords(keywords) };
+      for (const key of BOOL_KEYS) if (typeof cfg[key] === 'boolean') body[key] = cfg[key];
+      for (const key of NUM_KEYS) if (cfg[key] !== undefined) body[key] = Number(cfg[key]);
+      for (const key of STR_KEYS) if (typeof cfg[key] === 'string') body[key] = cfg[key];
+      return body;
+    }
+
+    function sec(ms) {
+      const n = Number(ms) || 0;
+      return `${(n / 1000).toFixed(n % 1000 === 0 ? 0 : 1)}s`;
+    }
+
+    function readOpenCards() {
+      try {
+        const raw = globalThis.localStorage?.getItem(OPEN_KEY);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (parsed && typeof parsed === 'object') return { ...DEFAULT_OPEN, ...parsed };
+        }
+      } catch {
+        /* 隐私模式 / 存储被禁：用默认值即可 */
+      }
+      return DEFAULT_OPEN;
+    }
+
+    function writeOpenCards(next) {
+      try {
+        globalThis.localStorage?.setItem(OPEN_KEY, JSON.stringify(next));
+      } catch {
+        /* 忽略 */
+      }
+    }
+
+    /** 折叠状态记在 localStorage 里，下次打开设置页保持上次的样子。 */
+    function useOpenCards() {
+      const [open, setOpen] = useState(readOpenCards);
+      const toggle = useCallback((key) => {
+        setOpen((prev) => {
+          const next = { ...prev, [key]: !prev[key] };
+          writeOpenCards(next);
+          return next;
+        });
+      }, []);
+      const setAll = useCallback((value) => {
+        setOpen(() => {
+          const next = {};
+          for (const key of Object.keys(DEFAULT_OPEN)) next[key] = value;
+          writeOpenCards(next);
+          return next;
+        });
+      }, []);
+      return { open, toggle, setAll };
+    }
+
+    function Toggle({ id, checked, onChange, disabled }) {
+      return h(
+        'button',
+        {
+          id,
+          type: 'button',
+          role: 'switch',
+          'aria-checked': checked ? 'true' : 'false',
+          disabled,
+          onClick: () => onChange(!checked),
+          style: {
+            position: 'relative',
+            flex: '0 0 auto',
+            width: 38,
+            height: 22,
+            padding: 0,
+            border: 0,
+            borderRadius: 999,
+            background: checked ? ACCENT : 'rgba(127,127,127,.34)',
+            cursor: disabled ? 'default' : 'pointer',
+            opacity: disabled ? 0.5 : 1,
+            transition: 'background .16s ease',
+          },
+        },
+        h('span', {
+          style: {
+            position: 'absolute',
+            top: 2,
+            left: checked ? 18 : 2,
+            width: 18,
+            height: 18,
+            borderRadius: 999,
+            background: '#fff',
+            boxShadow: '0 1px 3px rgba(0,0,0,.3)',
+            transition: 'left .16s ease',
+          },
+        }),
+      );
+    }
+
+    /** 紧凑行：说明在左、控件在右。开关和数字用它。 */
+    function Row({ id, label, hint, tag, control }) {
+      return h(
+        'div',
+        { style: S.row },
+        h(
+          'div',
+          { style: S.rowText },
+          h(
+            'label',
+            { htmlFor: id, style: S.labelLine },
+            h('span', { style: S.label }, label),
+            tag ? h('span', { style: S.tag }, tag) : null,
+          ),
+          hint ? h('p', { style: S.hint }, hint) : null,
+        ),
+        h('div', { style: S.control }, control),
+      );
+    }
+
+    function Field({ id, label, hint, extra, children }) {
       return h(
         'div',
         { style: S.field },
-        h('label', { style: S.label, htmlFor: id }, label),
+        h(
+          'div',
+          { style: S.labelLine },
+          h('label', { htmlFor: id, style: S.label }, label),
+          extra || null,
+        ),
+        children,
+        hint ? h('p', { style: S.hint }, hint) : null,
+      );
+    }
+
+    function NumberRow({ id, label, hint, value, min, max, onChange }) {
+      return h(Row, {
+        id,
+        label,
+        hint,
+        control: h('input', {
+          id,
+          type: 'number',
+          min,
+          max,
+          inputMode: 'numeric',
+          style: S.numberInput,
+          value: value ?? '',
+          onChange: (event) => onChange(Number(event.target.value)),
+        }),
+      });
+    }
+
+    /** 网格里的小数字格：标签在上、输入框铺满，用来两列并排。 */
+    function NumberCell({ id, label, hint, value, min, max, onChange }) {
+      return h(
+        Field,
+        { id, label, hint },
         h('input', {
           id,
           type: 'number',
           min,
           max,
-          style: S.input,
+          inputMode: 'numeric',
+          style: { ...S.numberInput, width: '100%' },
           value: value ?? '',
           onChange: (event) => onChange(Number(event.target.value)),
         }),
-        hint ? h('p', { style: S.hint }, hint) : null,
+      );
+    }
+
+    function SelectField({ id, label, hint, value, options, onChange }) {
+      return h(
+        Field,
+        { id, label, hint },
+        h(
+          'select',
+          { id, style: S.select, value, onChange: (event) => onChange(event.target.value) },
+          options.map(([optionValue, text]) => h('option', { key: optionValue, value: optionValue }, text)),
+        ),
+      );
+    }
+
+    function TextField({ id, label, hint, placeholder, value, onChange }) {
+      return h(
+        Field,
+        { id, label, hint },
+        h('input', {
+          id,
+          type: 'text',
+          style: S.input,
+          placeholder,
+          value: value ?? '',
+          onChange: (event) => onChange(event.target.value),
+        }),
+      );
+    }
+
+    /** 可折叠卡片：标题 + 当前值摘要，收起也知道里面是什么。 */
+    function Card({ cardId, title, summary, open, onToggle, children }) {
+      const bodyId = `qqbot-guard-card-${cardId}`;
+      return h(
+        'section',
+        { style: S.card },
+        h(
+          'button',
+          {
+            type: 'button',
+            style: S.cardHeader,
+            onClick: () => onToggle(cardId),
+            'aria-expanded': open,
+            'aria-controls': bodyId,
+          },
+          h(
+            'span',
+            { style: S.cardHeaderText },
+            h('span', { style: S.cardTitle }, title),
+            summary ? h('span', { style: S.cardSummary }, summary) : null,
+          ),
+          h('span', { style: { ...S.chevron, transform: open ? 'rotate(45deg)' : 'rotate(-45deg)' } }),
+        ),
+        open
+          ? h('div', { id: bodyId, style: S.cardBody }, children)
+          : null,
       );
     }
 
@@ -302,14 +808,19 @@ window.__ModuleLoader__.load({
       const [config, setConfig] = useState(null);
       const [keywords, setKeywords] = useState('');
       const [overridden, setOverridden] = useState([]);
+      const [baseline, setBaseline] = useState(null);
+      const { open, toggle, setAll } = useOpenCards();
 
       const applyPayload = useCallback((payload) => {
         const cfg = payload?.config ?? {};
+        const list = Array.isArray(cfg.triggers) ? cfg.triggers.join('\n') : '';
         setConfig(cfg);
         setFile(payload?.file ?? '');
         setStatus(payload?.status ?? {});
         setOverridden(Array.isArray(payload?.overridden) ? payload.overridden : []);
-        setKeywords(Array.isArray(cfg.triggers) ? cfg.triggers.join('\n') : '');
+        setKeywords(list);
+        setBaseline(JSON.stringify(buildBody(cfg, list)));
+        setNotice('');
       }, []);
 
       const load = useCallback(async () => {
@@ -335,59 +846,19 @@ window.__ModuleLoader__.load({
         setNotice('');
       }, []);
 
+      const body = useMemo(() => buildBody(config, keywords), [config, keywords]);
+      const dirty = baseline !== null && JSON.stringify(body) !== baseline;
+
       const save = useCallback(async () => {
         if (!config) return;
         setSaving(true);
         setError('');
         setNotice('');
         try {
-          const body = {
-            triggers: keywords
-              .split(/\r?\n|,|，/)
-              .map((s) => s.trim())
-              .filter(Boolean),
-          };
-          for (const key of [
-            'enabled',
-            'ignoreCase',
-            'faces',
-            'historyAttachments',
-            'historyMedia',
-            'verbose',
-            'strictVersion',
-            'followUpEnabled',
-            'followUpQuoteReply',
-          ]) {
-            if (typeof config[key] === 'boolean') body[key] = config[key];
-          }
-          if (config.historyMediaMaxMB !== undefined) body.historyMediaMaxMB = config.historyMediaMaxMB;
-          for (const key of [
-            'followUpWindowMinutes',
-            'followUpBurstMs',
-            'followUpBurstMax',
-            'followUpMaxTurns',
-            'followUpJudgeTimeoutMs',
-            'followUpFloodWindowMs',
-            'followUpFloodMax',
-            'followUpFloodCooldownMs',
-            'followUpSelectMin',
-          ]) {
-            if (config[key] !== undefined) body[key] = Number(config[key]);
-          }
-          for (const key of ['followUpJudgeProvider', 'followUpJudgeModel']) {
-            if (typeof config[key] === 'string') body[key] = config[key];
-          }
-          if (typeof config.followUpOnJudgeError === 'string') {
-            body.followUpOnJudgeError = config.followUpOnJudgeError;
-          }
-          if (typeof config.followUpFloodAction === 'string') {
-            body.followUpFloodAction = config.followUpFloodAction;
-          }
-          if (typeof config.qqbotPackage === 'string') body.qqbotPackage = config.qqbotPackage;
           const response = await fetch(API, {
             method: 'PUT',
             headers: { 'content-type': 'application/json', accept: 'application/json' },
-            body: JSON.stringify(body),
+            body: JSON.stringify(buildBody(config, keywords)),
           });
           const payload = await response.json().catch(() => ({}));
           if (!response.ok) throw new Error(payload?.error || `HTTP ${response.status}`);
@@ -421,218 +892,407 @@ window.__ModuleLoader__.load({
         );
       }
 
+      const count = parseKeywords(keywords).length;
+      const handlingOn = HANDLING_TOGGLES.filter(([key]) => config[key] !== false).length;
+      const followOn = config.followUpEnabled !== false;
+      const stickerOn = config.followUpStickerEnabled !== false;
+      const floodAction = config.followUpFloodAction ?? 'select';
+      const replyMode = config.followUpReplyMode ?? 'auto';
+      const ackMode = config.followUpAckMode ?? 'renew';
+      const onError = config.followUpOnJudgeError ?? 'skip';
+
+      const wakeSummary = `${config.enabled !== false ? t('summaryOn') : t('summaryOff')} · ${count} ${t('keywordUnit')}`;
+      const handlingSummary = `${t('summaryOn')} ${handlingOn}/${HANDLING_TOGGLES.length}`;
+      const followSummary = followOn
+        ? `${config.followUpWindowMinutes ?? 10} ${t('unitMinutes')} · ${t(REPLY_SHORT[replyMode] ?? 'replyShortAuto')}${
+            config.followUpQuoteReply !== false ? ` · ${t('quoteShort')}` : ''
+          }`
+        : t('summaryOff');
+      const stickerSummary = stickerOn
+        ? `${t(ACK_SHORT[ackMode] ?? 'ackShortRenew')} · ${sec(config.followUpStickerCooldownMs ?? 4000)}`
+        : t('summaryOff');
+      const burstSummary = `${sec(config.followUpBurstMs ?? 1200)} · ${t('summaryPerBatch')} ${
+        config.followUpBurstMax ?? 12
+      } ${t('unitMessages')} · ${t('summaryMaxWait')} ${sec(config.followUpBurstMaxWaitMs ?? 4000)}`;
+      const floodSummary = `${t(FLOOD_SHORT[floodAction] ?? 'floodShortSelect')} · ${sec(
+        config.followUpFloodWindowMs ?? 10000,
+      )} ${config.followUpFloodMax ?? 15} ${t('unitMessages')} · ${t('summaryCooldown')} ${sec(
+        config.followUpFloodCooldownMs ?? 25000,
+      )}`;
+      const judgeSummary = `${sec(config.followUpJudgeTimeoutMs ?? 6000)} · ${
+        config.followUpJudgeProvider || 'auto'
+      } · ${t(onError === 'reply' ? 'judgeShortReply' : 'judgeShortSkip')}`;
+      const advancedSummary = `${config.qqbotPackage || t('autoDetect')} · ${config.historyMediaMaxMB ?? 20} MB`;
+
+      let stateText = null;
+      if (error) {
+        stateText = h('span', { style: { ...S.notice, color: 'rgba(214,80,80,.95)' }, role: 'alert' }, error);
+      } else if (dirty) {
+        stateText = h('span', { style: { ...S.notice, color: 'rgba(214,140,60,.95)' }, role: 'status' }, t('dirty'));
+      } else if (notice) {
+        stateText = h('span', { style: { ...S.notice, color: 'rgba(64,160,96,.95)' }, role: 'status' }, notice);
+      } else if (baseline !== null) {
+        stateText = h('span', { style: { ...S.hint, opacity: 0.5 } }, t('upToDate'));
+      }
+
       return h(
         'div',
         { style: S.root },
         h('p', { style: S.intro }, t('intro')),
 
+        // 运行状态：一条紧凑的条，不再占一整张卡
         h(
-          'section',
-          { style: S.card },
-          h('h3', { style: S.cardTitle }, t('status')),
+          'div',
+          { style: S.statusStrip },
           h(
             'div',
-            { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
+            { style: S.statusRow },
             statusBits.map((bit) =>
-              h('span', {
-                key: bit.key,
-                style: { ...S.badge, borderColor: bit.tone === 'ok' ? 'rgba(64,160,96,.55)' : 'rgba(214,140,60,.55)' },
-              }, bit.text),
+              h(
+                'span',
+                {
+                  key: bit.key,
+                  style: {
+                    ...S.badge,
+                    borderColor: bit.tone === 'ok' ? 'rgba(64,160,96,.55)' : 'rgba(214,140,60,.55)',
+                  },
+                },
+                bit.text,
+              ),
             ),
+            status?.followUpWindows !== undefined
+              ? h('span', { style: S.badge }, `${t('followUpWindows')} ${status.followUpWindows}`)
+              : null,
           ),
-          h(
-            'p',
-            { style: S.hint },
-            h('span', null, `${t('location')}: `),
-            h('span', { style: S.mono }, status?.qqbot || t('notFound')),
-          ),
-          file
-            ? h(
-                'p',
-                { style: S.hint },
-                h('span', null, `${t('file')}: `),
-                h('span', { style: S.mono }, file),
-              )
-            : null,
+          h('p', { style: S.pathLine }, `${t('location')}: ${status?.qqbot || t('notFound')}`),
+          file ? h('p', { style: S.pathLine }, `${t('file')}: ${file}`) : null,
         ),
 
         h(
-          'section',
-          { style: S.card },
-          h('h3', { style: S.cardTitle }, t('keywords')),
-          h('textarea', {
-            style: S.textarea,
-            value: keywords,
-            spellCheck: false,
-            placeholder: '大肥鱼\n肥鱼\n鱼鱼',
-            onChange: (event) => {
-              setKeywords(event.target.value);
-              setNotice('');
-            },
-          }),
-          h('p', { style: S.hint }, t('keywordsHint')),
+          'div',
+          { style: S.toolbar },
+          h('button', { type: 'button', style: S.linkButton, onClick: () => setAll(true) }, t('expandAll')),
+          h('span', { style: { opacity: 0.3, fontSize: 12 } }, '·'),
+          h('button', { type: 'button', style: S.linkButton, onClick: () => setAll(false) }, t('collapseAll')),
         ),
 
+        // 唤醒与开关
         h(
-          'section',
-          { style: S.card },
-          h('h3', { style: S.cardTitle }, t('switches')),
-          h(
-            'div',
-            { style: { ...S.row, borderTop: 'none' } },
-            h(
-              'label',
-              { htmlFor: 'qqbot-guard-enabled', style: S.rowText },
-              h('span', { style: S.label }, t('enabled')),
-              h('span', { style: S.hint }, t('enabledHint')),
-            ),
-            h(Toggle, {
+          Card,
+          {
+            cardId: 'wake',
+            title: t('cardWake'),
+            summary: wakeSummary,
+            open: open.wake,
+            onToggle: toggle,
+          },
+          h(Row, {
+            id: 'qqbot-guard-enabled',
+            label: t('enabled'),
+            hint: t('enabledHint'),
+            tag: t('restartTag'),
+            control: h(Toggle, {
               id: 'qqbot-guard-enabled',
               checked: config.enabled !== false,
               onChange: (value) => patch('enabled', value),
             }),
+          }),
+          h(
+            Field,
+            {
+              id: 'qqbot-guard-keywords',
+              label: t('keywords'),
+              hint: t('keywordsHint'),
+              extra: h('span', { style: S.chip }, `${count} ${t('keywordUnit')}`),
+            },
+            h('textarea', {
+              id: 'qqbot-guard-keywords',
+              style: S.textarea,
+              value: keywords,
+              spellCheck: false,
+              placeholder: '大肥鱼\n肥鱼\n鱼鱼',
+              onChange: (event) => {
+                setKeywords(event.target.value);
+                setNotice('');
+              },
+            }),
           ),
-          TOGGLE_ROWS.map(([key, labelKey, hintKey]) =>
-            h(
-              'div',
-              { key, style: S.row },
-              h(
-                'label',
-                { htmlFor: `qqbot-guard-${key}`, style: S.rowText },
-                h('span', { style: S.label }, t(labelKey)),
-                hintKey ? h('span', { style: S.hint }, t(hintKey)) : null,
-              ),
-              h(Toggle, {
+        ),
+
+        // 消息处理
+        h(
+          Card,
+          {
+            cardId: 'handling',
+            title: t('cardHandling'),
+            summary: handlingSummary,
+            open: open.handling,
+            onToggle: toggle,
+          },
+          HANDLING_TOGGLES.map(([key, hintKey, needsRestart]) =>
+            h(Row, {
+              key,
+              id: `qqbot-guard-${key}`,
+              label: t(key),
+              hint: hintKey ? t(hintKey) : null,
+              tag: needsRestart ? t('restartTag') : null,
+              control: h(Toggle, {
                 id: `qqbot-guard-${key}`,
                 checked: config[key] !== false,
                 onChange: (value) => patch(key, value),
               }),
-            ),
+            }),
           ),
         ),
 
+        // 续聊窗口
         h(
-          'section',
-          { style: S.card },
-          h('h3', { style: S.cardTitle }, t('followUp')),
-          h('p', { style: S.hint }, t('followUpHint')),
-          h(
-            'div',
-            { style: { ...S.row, borderTop: 'none' } },
-            h(
-              'label',
-              { htmlFor: 'qqbot-guard-followup', style: S.rowText },
-              h('span', { style: S.label }, t('followUpEnabled')),
-              h('span', { style: S.hint }, t('followUpEnabledHint')),
-            ),
-            h(Toggle, {
+          Card,
+          {
+            cardId: 'follow',
+            title: t('followUp'),
+            summary: followSummary,
+            open: open.follow,
+            onToggle: toggle,
+          },
+          h(Row, {
+            id: 'qqbot-guard-followup',
+            label: t('followUpEnabled'),
+            hint: t('followUpEnabledHint'),
+            control: h(Toggle, {
               id: 'qqbot-guard-followup',
-              checked: config.followUpEnabled !== false,
+              checked: followOn,
               onChange: (value) => patch('followUpEnabled', value),
             }),
-          ),
+          }),
           h(
             'div',
-            { style: S.row },
-            h(
-              'label',
-              { htmlFor: 'qqbot-guard-followup-quote', style: S.rowText },
-              h('span', { style: S.label }, t('followUpQuoteReply')),
-              h('span', { style: S.hint }, t('followUpQuoteReplyHint')),
-            ),
-            h(Toggle, {
-              id: 'qqbot-guard-followup-quote',
-              checked: config.followUpQuoteReply === true,
-              onChange: (value) => patch('followUpQuoteReply', value),
+            { style: S.grid },
+            h(NumberCell, {
+              id: 'qqbot-guard-followup-window',
+              label: t('followUpWindow'),
+              hint: t('followUpWindowHint'),
+              value: config.followUpWindowMinutes ?? 10,
+              min: 1,
+              max: 1440,
+              onChange: (value) => patch('followUpWindowMinutes', value),
+            }),
+            h(NumberCell, {
+              id: 'qqbot-guard-followup-turns',
+              label: t('followUpMaxTurns'),
+              hint: t('followUpMaxTurnsHint'),
+              value: config.followUpMaxTurns ?? 0,
+              min: 0,
+              max: 1000,
+              onChange: (value) => patch('followUpMaxTurns', value),
             }),
           ),
-          h(NumberField, {
-            id: 'qqbot-guard-followup-window',
-            label: t('followUpWindow'),
-            hint: t('followUpWindowHint'),
-            value: config.followUpWindowMinutes ?? 10,
-            min: 1,
-            max: 1440,
-            onChange: (value) => patch('followUpWindowMinutes', value),
+          h(SelectField, {
+            id: 'qqbot-guard-followup-reply-mode',
+            label: t('followUpReplyMode'),
+            hint: t('followUpReplyModeHint'),
+            value: replyMode,
+            options: [
+              ['auto', t('followUpReplyModeAuto')],
+              ['batch', t('followUpReplyModeBatch')],
+              ['each', t('followUpReplyModeEach')],
+            ],
+            onChange: (value) => patch('followUpReplyMode', value),
           }),
-          h(NumberField, {
-            id: 'qqbot-guard-followup-burst',
-            label: t('followUpBurst'),
-            hint: t('followUpBurstHint'),
-            value: config.followUpBurstMs ?? 1200,
-            min: 0,
-            max: 5000,
-            onChange: (value) => patch('followUpBurstMs', value),
+          h(Row, {
+            id: 'qqbot-guard-followup-quote',
+            label: t('followUpQuoteReply'),
+            hint: t('followUpQuoteReplyHint'),
+            control: h(Toggle, {
+              id: 'qqbot-guard-followup-quote',
+              checked: config.followUpQuoteReply !== false,
+              onChange: (value) => patch('followUpQuoteReply', value),
+            }),
           }),
-          h(NumberField, {
-            id: 'qqbot-guard-followup-burst-max',
-            label: t('followUpBurstMax'),
-            value: config.followUpBurstMax ?? 12,
-            min: 2,
-            max: 50,
-            onChange: (value) => patch('followUpBurstMax', value),
+          h(Row, {
+            id: 'qqbot-guard-followup-sticker',
+            label: t('followUpSticker'),
+            hint: t('followUpStickerHint'),
+            control: h(Toggle, {
+              id: 'qqbot-guard-followup-sticker',
+              checked: stickerOn,
+              onChange: (value) => patch('followUpStickerEnabled', value),
+            }),
+          }),
+        ),
+
+        // 附和表情
+        h(
+          Card,
+          {
+            cardId: 'sticker',
+            title: t('groupSticker'),
+            summary: stickerSummary,
+            open: open.sticker,
+            onToggle: toggle,
+          },
+          h(SelectField, {
+            id: 'qqbot-guard-followup-ack-mode',
+            label: t('followUpAckMode'),
+            hint: t('followUpAckModeHint'),
+            value: ackMode,
+            options: [
+              ['renew', t('followUpAckRenew')],
+              ['reply', t('followUpAckReply')],
+              ['ignore', t('followUpAckIgnore')],
+            ],
+            onChange: (value) => patch('followUpAckMode', value),
+          }),
+          h(Row, {
+            id: 'qqbot-guard-followup-ack-fast',
+            label: t('followUpAckFastPath'),
+            hint: t('followUpAckFastPathHint'),
+            control: h(Toggle, {
+              id: 'qqbot-guard-followup-ack-fast',
+              checked: config.followUpAckFastPath !== false,
+              onChange: (value) => patch('followUpAckFastPath', value),
+            }),
+          }),
+          stickerOn
+            ? h(
+                'div',
+                { style: S.grid },
+                h(NumberCell, {
+                  id: 'qqbot-guard-followup-sticker-cooldown',
+                  label: t('followUpStickerCooldown'),
+                  value: config.followUpStickerCooldownMs ?? 4000,
+                  min: 1000,
+                  max: 600000,
+                  onChange: (value) => patch('followUpStickerCooldownMs', value),
+                }),
+              )
+            : null,
+          stickerOn
+            ? h(TextField, {
+                id: 'qqbot-guard-followup-sticker-dir',
+                label: t('followUpStickerDir'),
+                hint: t('followUpStickerDirHint'),
+                placeholder: t('followUpStickerDirPlaceholder'),
+                value: config.followUpStickerDir ?? '',
+                onChange: (value) => patch('followUpStickerDir', value),
+              })
+            : null,
+        ),
+
+        // 批量与回复
+        h(
+          Card,
+          {
+            cardId: 'burst',
+            title: t('groupBurst'),
+            summary: burstSummary,
+            open: open.burst,
+            onToggle: toggle,
+          },
+          h(
+            'div',
+            { style: S.grid },
+            h(NumberCell, {
+              id: 'qqbot-guard-followup-burst',
+              label: t('followUpBurst'),
+              value: config.followUpBurstMs ?? 1200,
+              min: 0,
+              max: 5000,
+              onChange: (value) => patch('followUpBurstMs', value),
+            }),
+            h(NumberCell, {
+              id: 'qqbot-guard-followup-burst-max',
+              label: t('followUpBurstMax'),
+              value: config.followUpBurstMax ?? 12,
+              min: 2,
+              max: 50,
+              onChange: (value) => patch('followUpBurstMax', value),
+            }),
+          ),
+          h(NumberRow, {
+            id: 'qqbot-guard-followup-burst-max-wait',
+            label: t('followUpBurstMaxWait'),
+            hint: t('followUpBurstMaxWaitHint'),
+            value: config.followUpBurstMaxWaitMs ?? 4000,
+            min: 1000,
+            max: 20000,
+            onChange: (value) => patch('followUpBurstMaxWaitMs', value),
+          }),
+          h('p', { style: S.hint }, t('followUpBurstHint')),
+        ),
+
+        // 刷屏保护
+        h(
+          Card,
+          {
+            cardId: 'flood',
+            title: t('groupFlood'),
+            summary: floodSummary,
+            open: open.flood,
+            onToggle: toggle,
+          },
+          h(SelectField, {
+            id: 'qqbot-guard-followup-flood',
+            label: t('followUpFloodAction'),
+            hint: t('followUpFloodHint'),
+            value: floodAction,
+            options: [
+              ['select', t('followUpFloodSelect')],
+              ['skip', t('followUpFloodSkip')],
+            ],
+            onChange: (value) => patch('followUpFloodAction', value),
           }),
           h(
             'div',
-            { style: S.field },
-            h('label', { style: S.label, htmlFor: 'qqbot-guard-followup-flood' }, t('followUpFlood')),
-            h(
-              'select',
-              {
-                id: 'qqbot-guard-followup-flood',
-                style: S.input,
-                value: config.followUpFloodAction ?? 'select',
-                onChange: (event) => patch('followUpFloodAction', event.target.value),
-              },
-              h('option', { value: 'select' }, t('followUpFloodSelect')),
-              h('option', { value: 'skip' }, t('followUpFloodSkip')),
-            ),
-            h('p', { style: S.hint }, t('followUpFloodHint')),
+            { style: S.grid },
+            h(NumberCell, {
+              id: 'qqbot-guard-followup-flood-window',
+              label: t('followUpFloodWindow'),
+              value: config.followUpFloodWindowMs ?? 10000,
+              min: 1000,
+              max: 60000,
+              onChange: (value) => patch('followUpFloodWindowMs', value),
+            }),
+            h(NumberCell, {
+              id: 'qqbot-guard-followup-flood-max',
+              label: t('followUpFloodMax'),
+              value: config.followUpFloodMax ?? 15,
+              min: 1,
+              max: 200,
+              onChange: (value) => patch('followUpFloodMax', value),
+            }),
+            h(NumberCell, {
+              id: 'qqbot-guard-followup-flood-cooldown',
+              label: t('followUpFloodCooldown'),
+              value: config.followUpFloodCooldownMs ?? 25000,
+              min: 1000,
+              max: 600000,
+              onChange: (value) => patch('followUpFloodCooldownMs', value),
+            }),
+            floodAction === 'select'
+              ? h(NumberCell, {
+                  id: 'qqbot-guard-followup-select-min',
+                  label: t('followUpSelectMin'),
+                  value: config.followUpSelectMin ?? 5,
+                  min: 2,
+                  max: 50,
+                  onChange: (value) => patch('followUpSelectMin', value),
+                })
+              : null,
           ),
-          h(NumberField, {
-            id: 'qqbot-guard-followup-flood-window',
-            label: t('followUpFloodWindow'),
-            value: config.followUpFloodWindowMs ?? 10000,
-            min: 1000,
-            max: 60000,
-            onChange: (value) => patch('followUpFloodWindowMs', value),
-          }),
-          h(NumberField, {
-            id: 'qqbot-guard-followup-flood-max',
-            label: t('followUpFloodMax'),
-            value: config.followUpFloodMax ?? 15,
-            min: 1,
-            max: 200,
-            onChange: (value) => patch('followUpFloodMax', value),
-          }),
-          h(NumberField, {
-            id: 'qqbot-guard-followup-flood-cooldown',
-            label: t('followUpFloodCooldown'),
-            value: config.followUpFloodCooldownMs ?? 25000,
-            min: 1000,
-            max: 600000,
-            onChange: (value) => patch('followUpFloodCooldownMs', value),
-          }),
-          (config.followUpFloodAction ?? 'select') === 'select'
-            ? h(NumberField, {
-                id: 'qqbot-guard-followup-select-min',
-                label: t('followUpSelectMin'),
-                value: config.followUpSelectMin ?? 5,
-                min: 2,
-                max: 50,
-                onChange: (value) => patch('followUpSelectMin', value),
-              })
-            : null,
-          h(NumberField, {
-            id: 'qqbot-guard-followup-turns',
-            label: t('followUpMaxTurns'),
-            hint: t('followUpMaxTurnsHint'),
-            value: config.followUpMaxTurns ?? 0,
-            min: 0,
-            max: 1000,
-            onChange: (value) => patch('followUpMaxTurns', value),
-          }),
-          h(NumberField, {
+        ),
+
+        // 判定模型与失败策略
+        h(
+          Card,
+          {
+            cardId: 'judge',
+            title: t('groupJudge'),
+            summary: judgeSummary,
+            open: open.judge,
+            onToggle: toggle,
+          },
+          h(NumberRow, {
             id: 'qqbot-guard-followup-timeout',
             label: t('followUpJudgeTimeout'),
             value: config.followUpJudgeTimeoutMs ?? 6000,
@@ -642,100 +1302,64 @@ window.__ModuleLoader__.load({
           }),
           h(
             'div',
-            { style: S.field },
-            h('label', { style: S.label, htmlFor: 'qqbot-guard-followup-provider' }, t('followUpJudgeProvider')),
-            h('input', {
+            { style: S.grid },
+            h(TextField, {
               id: 'qqbot-guard-followup-provider',
-              style: S.input,
+              label: t('followUpJudgeProvider'),
+              placeholder: 'auto',
               value: config.followUpJudgeProvider ?? '',
-              placeholder: 'auto',
-              onChange: (event) => patch('followUpJudgeProvider', event.target.value),
+              onChange: (value) => patch('followUpJudgeProvider', value),
             }),
-          ),
-          h(
-            'div',
-            { style: S.field },
-            h('label', { style: S.label, htmlFor: 'qqbot-guard-followup-model' }, t('followUpJudgeModel')),
-            h('input', {
+            h(TextField, {
               id: 'qqbot-guard-followup-model',
-              style: S.input,
+              label: t('followUpJudgeModel'),
+              placeholder: 'auto',
               value: config.followUpJudgeModel ?? '',
-              placeholder: 'auto',
-              onChange: (event) => patch('followUpJudgeModel', event.target.value),
+              onChange: (value) => patch('followUpJudgeModel', value),
             }),
-            h('p', { style: S.hint }, t('followUpJudgeHint')),
           ),
-          h(
-            'div',
-            { style: S.field },
-            h('label', { style: S.label, htmlFor: 'qqbot-guard-followup-error' }, t('followUpOnError')),
-            h(
-              'select',
-              {
-                id: 'qqbot-guard-followup-error',
-                style: S.input,
-                value: config.followUpOnJudgeError ?? 'skip',
-                onChange: (event) => patch('followUpOnJudgeError', event.target.value),
-              },
-              h('option', { value: 'skip' }, t('followUpOnErrorSkip')),
-              h('option', { value: 'reply' }, t('followUpOnErrorReply')),
-            ),
-            h('p', { style: S.hint }, t('followUpOnErrorHint')),
-          ),
-          config.followUpEnabled !== false && status?.followUpWindows !== undefined
-            ? h(
-                'p',
-                { style: S.hint },
-                `${t('followUpWindows')}: ${status.followUpWindows}`,
-              )
-            : null,
+          h('p', { style: S.hint }, t('followUpJudgeHint')),
+          h(SelectField, {
+            id: 'qqbot-guard-followup-error',
+            label: t('followUpOnError'),
+            hint: t('followUpOnErrorHint'),
+            value: onError,
+            options: [
+              ['skip', t('followUpOnErrorSkip')],
+              ['reply', t('followUpOnErrorReply')],
+            ],
+            onChange: (value) => patch('followUpOnJudgeError', value),
+          }),
         ),
 
+        // 高级
         h(
-          'section',
-          { style: S.card },
-          h('h3', { style: S.cardTitle }, t('advanced')),
-          h(
-            'div',
-            { style: S.field },
-            h('label', { style: S.label, htmlFor: 'qqbot-guard-pkg' }, t('qqbotPackage')),
-            h('input', {
-              id: 'qqbot-guard-pkg',
-              style: S.input,
-              value: config.qqbotPackage ?? '',
-              placeholder: 'auto',
-              onChange: (event) => patch('qqbotPackage', event.target.value),
-            }),
-            h('p', { style: S.hint }, t('qqbotPackageHint')),
-          ),
-          h(
-            'div',
-            { style: S.field },
-            h('label', { style: S.label, htmlFor: 'qqbot-guard-maxmb' }, t('maxMB')),
-            h('input', {
-              id: 'qqbot-guard-maxmb',
-              type: 'number',
-              min: 1,
-              max: 1024,
-              style: S.input,
-              value: config.historyMediaMaxMB ?? 20,
-              onChange: (event) => patch('historyMediaMaxMB', Number(event.target.value)),
-            }),
-          ),
+          Card,
+          {
+            cardId: 'advanced',
+            title: t('advanced'),
+            summary: advancedSummary,
+            open: open.advanced,
+            onToggle: toggle,
+          },
+          h(TextField, {
+            id: 'qqbot-guard-pkg',
+            label: t('qqbotPackage'),
+            hint: t('qqbotPackageHint'),
+            placeholder: 'auto',
+            value: config.qqbotPackage ?? '',
+            onChange: (value) => patch('qqbotPackage', value),
+          }),
+          h(NumberRow, {
+            id: 'qqbot-guard-maxmb',
+            label: t('maxMB'),
+            value: config.historyMediaMaxMB ?? 20,
+            min: 1,
+            max: 1024,
+            onChange: (value) => patch('historyMediaMaxMB', value),
+          }),
         ),
 
-        h(
-          'div',
-          { style: S.footer },
-          h(
-            'button',
-            { type: 'button', style: { ...S.button, opacity: saving ? 0.6 : 1 }, disabled: saving, onClick: () => void save() },
-            saving ? t('saving') : t('save'),
-          ),
-          h('button', { type: 'button', style: S.buttonGhost, onClick: () => void load() }, t('reload')),
-          notice ? h('span', { style: { ...S.notice, color: 'rgba(64,160,96,.95)' } }, notice) : null,
-          error ? h('span', { style: { ...S.notice, color: 'rgba(214,80,80,.95)' }, role: 'alert' }, error) : null,
-        ),
         h('p', { style: S.hint }, t('restartNeeded')),
         overridden.length > 0
           ? h(
@@ -744,6 +1368,28 @@ window.__ModuleLoader__.load({
               `${t('overridden')} ${overridden.join(', ')}`,
             )
           : null,
+
+        // 粘底保存栏
+        h(
+          'div',
+          { style: S.footer },
+          h('div', { style: S.footerState }, stateText),
+          h(
+            'div',
+            { style: S.footerActions },
+            h('button', { type: 'button', style: S.buttonGhost, onClick: () => void load() }, t('reload')),
+            h(
+              'button',
+              {
+                type: 'button',
+                style: { ...S.button, ...(saving || !dirty ? S.buttonDisabled : null) },
+                disabled: saving || !dirty,
+                onClick: () => void save(),
+              },
+              saving ? t('saving') : t('save'),
+            ),
+          ),
+        ),
       );
     }
 

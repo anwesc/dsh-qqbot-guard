@@ -1,0 +1,16 @@
+鲸鱼娘表情（内置表情包之一）
+=============================
+这 9 张图片不适用本项目的 MIT 许可，单独按 CC BY-NC-SA 4.0 提供。
+
+形象来源：
+- 基础角色「鲸鱼娘」：上善无形
+- DeepSeek 女仆二次设计：ZipZipPipe
+- 本组表情：由用户提供生成图切分整理（去底、裁切、加白描边）
+
+许可：Creative Commons Attribution-NonCommercial-ShareAlike 4.0
+      https://creativecommons.org/licenses/by-nc-sa/4.0/
+- 允许：个人、非商业地使用、修改、分享，需署名并沿用相同许可。
+- 不允许：商业用途（包括付费产品或服务中使用）。
+- 商用请删除本目录（`assets/stickers/whale-chan/`），代码部分仍可按 MIT 使用。
+
+礼貌提醒：这是同人二创，角色版权归原作者；如需商用请联系原作者取得书面授权。

@@ -14,10 +14,16 @@ import {
   createFloodGate,
   createFollowUpState,
   createGuard,
+  createStickerSender,
   createTurnQueue,
   buildFollowUpJudgeInput,
   buildFollowUpSelectInput,
+  guessStickerMood,
+  guessStickerMoodFromItems,
   installOutboundRecorder,
+  isAckMessage,
+  listStickers,
+  parseFollowUpDecision,
   parseFollowUpSelection,
   parseFollowUpVerdict,
   resolveFollowUpRoute,
@@ -144,6 +150,44 @@ test('parseFollowUpVerdict：只认明确的 0/1', () => {
   assert.equal(parseFollowUpVerdict('0 或 1'), null);
 });
 
+test('parseFollowUpDecision：相关 + 形态；场景内只续期；无关静默', () => {
+  assert.deepEqual(parseFollowUpDecision('2m'), {
+    action: 'reply',
+    verdict: true,
+    mode: 'merge',
+    selected: null,
+  });
+  assert.equal(parseFollowUpDecision('2e').mode, 'each');
+  assert.equal(parseFollowUpDecision('```\n2e\n```').action, 'reply');
+  assert.equal(parseFollowUpDecision('1').action, 'ack');
+  assert.equal(parseFollowUpDecision('0').action, 'ignore');
+  // 纯编号是旧版输出：当成「相关但逐条」，不猜合并
+  assert.equal(parseFollowUpDecision('2').mode, 'each');
+  // 数字串不能被当成 1 或 0
+  assert.equal(parseFollowUpDecision('10'), null);
+  assert.equal(parseFollowUpDecision('0 或 1'), null);
+  assert.equal(parseFollowUpDecision('我觉得相关'), null);
+
+  const picked = parseFollowUpDecision('m:1,3', 4);
+  assert.deepEqual(picked, { action: 'reply', verdict: true, mode: 'merge', selected: [1, 3] });
+  assert.deepEqual(parseFollowUpDecision('e：2，4', 4).selected, [2, 4]);
+  assert.equal(parseFollowUpDecision('0', 3).action, 'ignore');
+});
+
+test('isAckMessage：只把短附和当场景反应，问句和正经消息不算', () => {
+  assert.equal(isAckMessage('哈哈哈'), true);
+  assert.equal(isAckMessage('笑死我了'), true);
+  assert.equal(isAckMessage('确实'), true);
+  assert.equal(isAckMessage('+1'), true);
+  assert.equal(isAckMessage('收到'), true);
+  assert.equal(isAckMessage('嗯嗯'), true);
+  assert.equal(isAckMessage('🤣🤣🤣'), true);
+  assert.equal(isAckMessage('哈哈哈哈然后呢？'), false);
+  assert.equal(isAckMessage('这个报错怎么修'), false);
+  assert.equal(isAckMessage('好的，那明天下午三点开会'), false);
+  assert.equal(isAckMessage(''), false);
+});
+
 test('buildFollowUpJudgeInput：带最近发言、发送者与引用标记', () => {
   const text = buildFollowUpJudgeInput({
     recent: [
@@ -244,29 +288,33 @@ test('runFollowUpJudge：把推理档位透传给 llm.stream', async () => {
   assert.ok(seen.maxTokens >= 512, `maxTokens 太小会只剩思考：${seen.maxTokens}`);
 });
 
-test('runFollowUpJudge：1/0 解析成 true/false', async () => {
-  const llm = fakeLlm('1');
-  assert.equal(
-    await runFollowUpJudge({
-      llm,
+test('runFollowUpJudge：2m/2e/1/0 解析成回复形态', async () => {
+  const run = (reply) =>
+    runFollowUpJudge({
+      llm: fakeLlm(reply),
       route: { provider: 'p', model: 'm' },
       recent: [],
       message: '继续',
       logger: silent,
-    }),
-    true,
-  );
-  assert.equal(
-    await runFollowUpJudge({
-      llm: fakeLlm('0'),
-      route: { provider: 'p', model: 'm' },
-      recent: [],
-      message: '今天吃啥',
-      logger: silent,
-    }),
-    false,
-  );
-  assert.equal(llm.calls, 1);
+    });
+
+  const merge = await run('2m');
+  assert.equal(merge.action, 'reply');
+  assert.equal(merge.verdict, true);
+  assert.equal(merge.mode, 'merge');
+
+  const each = await run('2e');
+  assert.equal(each.mode, 'each');
+  assert.equal(each.verdict, true);
+
+  // 1 = 场景内的附和/反应：只续期，不回复
+  const ack = await run('1');
+  assert.equal(ack.action, 'ack');
+  assert.equal(ack.verdict, false);
+
+  const unrelated = await run('0');
+  assert.equal(unrelated.action, 'ignore');
+  assert.equal(unrelated.verdict, false);
 });
 
 test('runFollowUpJudge：解析失败 / 流内报错 / 缺服务都抛错（由门禁兜底）', async () => {
@@ -368,9 +416,9 @@ async function feed(guard, msg, ctx = makeCtx()) {
   return nexted;
 }
 
-function guarded(followUp, over = {}) {
+function guarded(followUp, over = {}, extras = {}) {
   let judgeCalls = 0;
-  let reply = '1';
+  let reply = '2m';
   const llm = {
     async *stream() {
       judgeCalls += 1;
@@ -387,6 +435,7 @@ function guarded(followUp, over = {}) {
       followUp,
       getLlm: () => llm,
       getRoute: () => ({ provider: 'p', model: 'm' }),
+      ...extras,
     },
   );
   return {
@@ -848,10 +897,11 @@ test('串行队列：同一群的上一条跑完才轮下一条', async () => {
   assert.deepEqual(order, ['start:1', 'end:1', 'start:2', 'end:2', 'start:3', 'end:3']);
 });
 
-test('门禁：短时间多条只判一次，但逐条放行、一条一轮', async () => {
+test('门禁：短时间多条只判一次，判 2e 时逐条放行、一条一轮', async () => {
   const followUp = createFollowUpState({ windowMs: 600_000 });
   const harness = guarded(followUp, { followUpBurstMs: 20 });
   await feed(harness.guard, makeMsg({ content: '大肥鱼 在吗' }));
+  harness.setReply('2e');
 
   let active = 0;
   let maxActive = 0;
@@ -970,12 +1020,21 @@ test('buildFollowUpSelectInput：最近群聊 + 编号列表', () => {
   assert.match(input, /\[2\] 今晚开黑/);
 });
 
-test('runFollowUpSelectJudge：返回编号；答非所问抛错', async () => {
+test('runFollowUpSelectJudge：返回编号与形态；答非所问抛错', async () => {
   const route = { provider: 'p', model: 'm' };
   const llm = fakeLlm('2');
   assert.deepEqual(
     await runFollowUpSelectJudge({ llm, route, recent: [], items: [{ text: 'a' }, { text: 'b' }], logger: silent }),
-    [2],
+    { selected: [2], mode: 'each' },
+  );
+  assert.deepEqual(
+    await runFollowUpSelectJudge({
+      llm: fakeLlm('m:1,2'),
+      route,
+      items: [{ text: 'a' }, { text: 'b' }],
+      logger: silent,
+    }),
+    { selected: [1, 2], mode: 'merge' },
   );
   await assert.rejects(
     runFollowUpSelectJudge({ llm: fakeLlm('不好说'), route, items: [{ text: 'a' }], logger: silent }),
@@ -1016,6 +1075,128 @@ test('门禁：select 模式只放行被挑中的那条', async () => {
   assert.equal(followUp.get('group-1').turns, 2);
 });
 
+test('门禁：判 2m 时合并成一条——只放行最后一条，其余只进历史', async () => {
+  const followUp = createFollowUpState({ windowMs: 600_000 });
+  const harness = guarded(followUp, { followUpBurstMs: 20 });
+  await feed(harness.guard, makeMsg({ content: '大肥鱼 在吗' }));
+
+  const msgs = [1, 2, 3].map((i) => makeMsg({ content: `追问 ${i}`, messageId: `mg-${i}` }));
+  const nexted = await Promise.all(msgs.map((msg) => feed(harness.guard, msg)));
+
+  assert.deepEqual(nexted, [false, false, true], '只有最后一条进 agent');
+  assert.equal(harness.judgeCalls(), 1);
+  assert.equal(msgs[0].mentions.length, 0);
+  assert.equal(msgs[1].mentions.length, 0);
+  assert.ok(msgs[2].mentions.some((m) => m?.is_you === true));
+  // 三条都在续聊上下文里，模型才写得出合并回复
+  assert.deepEqual(
+    followUp.recent('group-1').map((e) => e.text).slice(-3),
+    ['追问 1', '追问 2', '追问 3'],
+  );
+});
+
+test('门禁：纯笑声/附和走快通道，只续期、不调模型、不回', async () => {
+  const followUp = createFollowUpState({ windowMs: 600_000 });
+  const harness = guarded(followUp, { followUpBurstMs: 0 });
+  await feed(harness.guard, makeMsg({ content: '大肥鱼 在吗' }));
+  const before = followUp.get('group-1').turns;
+
+  const ack = makeMsg({ content: '哈哈哈', messageId: 'ack-1' });
+  assert.equal(await feed(harness.guard, ack), false);
+  assert.equal(harness.judgeCalls(), 0, '附和不该花模型调用');
+  assert.equal(ack.mentions.length, 0);
+  assert.equal(followUp.get('group-1').turns, before, '附和只续期，不占回复条数');
+  assert.equal(followUp.recent('group-1').at(-1).text, '哈哈哈');
+});
+
+test('门禁：followUpAckMode=ignore 时附着完全不理会（不续期、不判定）', async () => {
+  const followUp = createFollowUpState({ windowMs: 600_000 });
+  const harness = guarded(followUp, { followUpBurstMs: 0, followUpAckMode: 'ignore' });
+  await feed(harness.guard, makeMsg({ content: '大肥鱼 在吗' }));
+  const before = followUp.stats('group-1');
+
+  const ack = makeMsg({ content: '收到', messageId: 'ack-2' });
+  // ignore 不补 mention，交给下游 mentionGate 拦停（测试里的 next 只是继续链路，不代表会被回复）
+  assert.equal(await feed(harness.guard, ack), true);
+  assert.equal(harness.judgeCalls(), 0);
+  assert.equal(ack.mentions.length, 0);
+  assert.equal(followUp.stats('group-1').lastRelatedAt, before.lastRelatedAt, 'ignore 不该续期');
+  assert.equal(followUp.recent('group-1').at(-1).text, '大肥鱼 在吗');
+});
+
+test('门禁：强制 batch / each 覆盖模型给的形态', async () => {
+  const f1 = createFollowUpState({ windowMs: 600_000 });
+  const h1 = guarded(f1, { followUpBurstMs: 20, followUpReplyMode: 'batch' });
+  await feed(h1.guard, makeMsg({ content: '大肥鱼' }));
+  h1.setReply('2e');
+  const m1 = [1, 2].map((i) => makeMsg({ content: `批 ${i}`, messageId: `b-${i}` }));
+  const n1 = await Promise.all(m1.map((m) => feed(h1.guard, m)));
+  assert.deepEqual(n1, [false, true], 'batch 强制合并');
+
+  const f2 = createFollowUpState({ windowMs: 600_000 });
+  const h2 = guarded(f2, { followUpBurstMs: 20, followUpReplyMode: 'each' });
+  await feed(h2.guard, makeMsg({ content: '大肥鱼' }));
+  h2.setReply('2m');
+  const m2 = [1, 2].map((i) => makeMsg({ content: `逐 ${i}`, messageId: `e-${i}` }));
+  const n2 = await Promise.all(m2.map((m) => feed(h2.guard, m)));
+  assert.deepEqual(n2, [true, true], 'each 强制逐条');
+});
+
+test('窗口：renew 不增加 turns；suppressQuote 只压一条消息的引用', async () => {
+  const c = clock();
+  const state = createFollowUpState({ now: c.now, windowMs: 600_000 });
+  state.open('g1');
+  state.touch('g1');
+  c.advance(60_000);
+  state.renew('g1');
+  assert.equal(state.get('g1').turns, 1);
+  assert.equal(state.stats('g1').remainingMs, 600_000);
+
+  state.suppressQuote('g1', 'm-9');
+  assert.equal(state.shouldSuppressQuote('g1', 'm-9'), true);
+  assert.equal(state.shouldSuppressQuote('g1', 'm-8'), false);
+  state.suppressQuote('g1', '');
+  assert.equal(state.shouldSuppressQuote('g1', 'm-9'), false);
+  assert.equal(state.shouldSuppressQuote('g2', 'm-9'), false);
+});
+
+test('installOutboundRecorder：合并回复即使开了引用也不带 message_reference', async () => {
+  const calls = { plain: 0, send: 0 };
+  class BothBot {
+    async sendMarkdown() {
+      calls.plain += 1;
+      return { id: 'plain', timestamp: 0 };
+    }
+    async send() {
+      calls.send += 1;
+      return { id: 'quoted', timestamp: 0 };
+    }
+  }
+  const followUp = createFollowUpState();
+  followUp.open('g1');
+  followUp.suppressQuote('g1', 'm-7');
+  const installed = installOutboundRecorder(BothBot, followUp, silent, {
+    readConfig: () => ({ followUpQuoteReply: true }),
+  });
+  await new BothBot().sendMarkdown({ scope: 'group', targetId: 'g1', msgId: 'm-7' }, '合并后的回复');
+  assert.deepEqual(calls, { plain: 1, send: 0 }, '被抑制的消息不走引用发送');
+  assert.equal(followUp.shouldSuppressQuote('g1', 'm-7'), false, '发完要清掉抑制标记');
+  installed.restored();
+});
+
+test('sanitizeConfigPatch：回复形态与附和处理只认枚举值', () => {
+  const ok = sanitizeConfigPatch({
+    followUpReplyMode: 'batch',
+    followUpAckMode: 'ignore',
+    followUpAckFastPath: false,
+  });
+  assert.equal(ok.followUpReplyMode, 'batch');
+  assert.equal(ok.followUpAckMode, 'ignore');
+  assert.equal(ok.followUpAckFastPath, false);
+  assert.throws(() => sanitizeConfigPatch({ followUpReplyMode: 'smart' }), /auto、batch 或 each/);
+  assert.throws(() => sanitizeConfigPatch({ followUpAckMode: 'silent' }), /renew、reply 或 ignore/);
+});
+
 test('门禁：skip 模式刷屏时直接不回，也不调判定', async () => {
   const followUp = createFollowUpState({ windowMs: 600_000 });
   const harness = guarded(followUp, {
@@ -1052,4 +1233,181 @@ test('sanitizeConfigPatch：刷屏保护的取值边界', () => {
   assert.throws(() => sanitizeConfigPatch({ followUpFloodCooldownMs: 999 }), /1000~600000/);
   assert.throws(() => sanitizeConfigPatch({ followUpSelectMin: 1 }), /2~50/);
   assert.throws(() => sanitizeConfigPatch({ followUpFloodAction: 'mute' }), /skip 或 select/);
+});
+
+// ────────────────────────── 附和表情 ──────────────────────────
+
+test('表情包：内置目录能读到图片，随机发送、同群冷却、不连续重复', async () => {
+  const files = listStickers();
+  assert.ok(files.length >= 5, `内置表情至少 5 张，实际 ${files.length}`);
+  assert.ok(files.every((file) => /\.(png|jpe?g|gif|webp)$/i.test(file)));
+  assert.equal(listStickers('Z:\definitely-missing-dir').length, 0);
+  assert.equal(files.length, 9, '内置表情固定 9 张鲸鱼娘');
+
+  let now = 1_000_000;
+  const sent = [];
+  const bot = {
+    async sendImage(target, source) {
+      sent.push({ target, source });
+    },
+  };
+  const sender = createStickerSender({
+    stickers: files,
+    cooldownMs: 60_000,
+    now: () => now,
+    random: () => 0,
+    logger: silent,
+  });
+
+  assert.equal(await sender.send(bot, { scope: 'group', targetId: 'g1', msgId: 'm1' }), true);
+  assert.equal(sent.length, 1);
+  assert.deepEqual(sent[0].target, { scope: 'group', targetId: 'g1', msgId: 'm1' });
+  assert.ok(sent[0].source.localPath);
+
+  // 同群冷却内不再发
+  assert.equal(await sender.send(bot, { scope: 'group', targetId: 'g1', msgId: 'm2' }), false);
+  assert.equal(sent.length, 1);
+
+  // 冷却过后可发，且不会连挑同一张
+  now += 60_000;
+  assert.equal(await sender.send(bot, { scope: 'group', targetId: 'g1', msgId: 'm3' }), true);
+  assert.equal(sent.length, 2);
+  assert.notEqual(sent[0].source.localPath, sent[1].source.localPath);
+});
+
+test('表情包：没有 bot/图片或发送失败时安静跳过', async () => {
+  const warnings = [];
+  const sender = createStickerSender({
+    stickers: ['/tmp/a.png'],
+    cooldownMs: 0,
+    logger: { ...silent, warn: (msg) => warnings.push(String(msg)) },
+  });
+  assert.equal(await sender.send(null, { scope: 'group', targetId: 'g1' }), false);
+  assert.equal(await sender.send({ sendImage: async () => { throw new Error('upload boom'); } }, {
+    scope: 'group',
+    targetId: 'g1',
+  }), false);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /upload boom/);
+
+  const empty = createStickerSender({ stickers: [], logger: silent });
+  assert.equal(empty.size(), 0);
+  assert.equal(await empty.send({ sendImage: async () => {} }, { scope: 'group', targetId: 'g1' }), false);
+});
+
+test('门禁：场景内附和只发一张表情，不发文本（一批只发一次）', async () => {
+  const followUp = createFollowUpState({ windowMs: 600_000 });
+  const sent = [];
+  const stickerSender = {
+    size: () => 3,
+    async send(bot, target, options) {
+      sent.push({ ...target, mood: options?.mood ?? null });
+      return true;
+    },
+  };
+  const harness = guarded(followUp, { followUpBurstMs: 20 }, { stickerSender });
+  await feed(harness.guard, makeMsg({ content: '大肥鱼 在吗' }));
+
+  const first = makeMsg({ content: '哈哈哈', messageId: 's-1' });
+  const second = makeMsg({ content: '确实', messageId: 's-2' });
+  const [a, b] = await Promise.all([feed(harness.guard, first), feed(harness.guard, second)]);
+  assert.equal(harness.judgeCalls(), 0, '纯附和不调模型');
+  assert.equal(a, false);
+  assert.equal(b, false);
+  assert.equal(sent.length, 1, '一批附和只发一张');
+  assert.equal(sent[0].msgId, 's-1');
+  assert.equal(sent[0].mood, 'happy', '按文字猜出情绪，挑更贴切的表情');
+
+  // 关掉表情就只剩续期，不发图
+  const offHarness = guarded(followUp, { followUpBurstMs: 0, followUpStickerEnabled: false }, { stickerSender });
+  await feed(offHarness.guard, makeMsg({ content: '嗯嗯', messageId: 's-3' }));
+  assert.equal(sent.length, 1);
+});
+
+test('表情情绪：从文件名和文字里挑贴合的那一张', async () => {
+  assert.equal(guessStickerMood('哈哈哈哈哈'), 'happy');
+  assert.equal(guessStickerMood('吃瓜看戏'), 'melon');
+  assert.equal(guessStickerMood('晚安，睡了'), 'sleep');
+  assert.equal(guessStickerMood('这样行吗？'), 'question');
+  assert.equal(guessStickerMood('收到，谢谢'), 'like');
+  assert.equal(guessStickerMood('无语了……'), 'speechless');
+  assert.equal(guessStickerMood('卧槽真的假的'), 'shock');
+  assert.equal(guessStickerMood('呜呜破防了'), 'cry');
+  assert.equal(guessStickerMood('今天摸鱼'), 'lazy');
+  assert.equal(guessStickerMood('今天写了一天代码'), null);
+
+  assert.equal(guessStickerMoodFromItems([{ text: '哈哈哈' }, { text: '震惊' }]), 'shock');
+  assert.equal(guessStickerMoodFromItems([{ text: '今天写代码' }]), null);
+
+  assert.equal(parseFollowUpDecision('1 happy').mood, 'happy');
+  assert.equal(parseFollowUpDecision('1 melon').mood, 'melon');
+  assert.equal(parseFollowUpDecision('1').mood, null);
+  assert.equal(parseFollowUpDecision('1 随便').mood, null);
+
+  const sent = [];
+  const bot = {
+    async sendImage(target, source) {
+      sent.push(source.localPath);
+    },
+  };
+  const sender = createStickerSender({
+    stickers: ['/tmp/01-happy.png', '/tmp/03-melon.png'],
+    cooldownMs: 0,
+    random: () => 0,
+    logger: silent,
+  });
+  assert.equal(await sender.send(bot, { scope: 'group', targetId: 'g1', msgId: 'm1' }, { mood: 'melon' }), true);
+  assert.match(sent[0], /03-melon\.png$/);
+});
+
+test('批量窗口：续约式结算，但受最长等待硬上限约束', async () => {
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const calls = [];
+  const debounced = createBurstBatcher({
+    windowMs: 80,
+    maxWaitMs: 2000,
+    decide: async (items) => {
+      calls.push(items.map((it) => it.text));
+      return { action: 'reply', verdict: true, mode: 'merge' };
+    },
+  });
+  let settled = false;
+  const first = debounced.add('g1', { text: 'A' }).then((out) => {
+    settled = true;
+    return out;
+  });
+  await sleep(40);
+  const second = debounced.add('g1', { text: 'B' });
+  await sleep(25);
+  assert.equal(settled, false, '第二条到达后窗口应续约，不按第一条的 80ms 结算');
+  const [a, b] = await Promise.all([first, second]);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0], ['A', 'B']);
+  assert.equal(a.count, 2);
+  assert.equal(b.index, 2);
+
+  // 群里一直说话：窗口不断续约，但 maxWait 到了必须结算
+  const capped = [];
+  const startedAt = Date.now();
+  const batcher = createBurstBatcher({
+    windowMs: 5000,
+    maxWaitMs: 120,
+    decide: async (items) => {
+      capped.push(items.length);
+      return { action: 'ack', verdict: false };
+    },
+  });
+  const pending = batcher.add('g2', { text: '1' });
+  await sleep(60);
+  void batcher.add('g2', { text: '2' });
+  await sleep(60);
+  void batcher.add('g2', { text: '3' });
+  const out = await pending;
+  assert.ok(Date.now() - startedAt < 1000, '不能被 5 秒窗口拖住');
+  assert.equal(capped.length, 1);
+  assert.equal(out.count >= 2, true);
+
+  assert.equal(sanitizeConfigPatch({ followUpBurstMaxWaitMs: 1000 }).followUpBurstMaxWaitMs, 1000);
+  assert.throws(() => sanitizeConfigPatch({ followUpBurstMaxWaitMs: 500 }), /1000~20000/);
+  assert.throws(() => sanitizeConfigPatch({ followUpBurstMaxWaitMs: 20001 }), /1000~20000/);
 });
