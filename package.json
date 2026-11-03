@@ -1,6 +1,6 @@
 {
   "name": "dsh-qqbot-guard",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "type": "module",
   "description": "qqbot 增强层：群聊关键词放行 + 续聊窗口（批量汇总判定、逐条回复、刷屏保护只回相关、可选引用回复） + 历史上下文 + 设置页可视化配置（进程内补丁，不改 qqbot 文件）",
   "license": "MIT",

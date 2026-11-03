@@ -202,7 +202,47 @@ test('resolveFollowUpRoute：显式 > 宿主 > 半配置不猜', () => {
   assert.equal(resolveFollowUpRoute({ ...base }, () => null), null);
 });
 
+test('resolveFollowUpRoute：带上宿主的推理档位，半配置补齐时也保留', () => {
+  const host = () => ({
+    provider: 'deepseek-official',
+    model: 'deepseek-flash',
+    reasoningEffort: 'high',
+  });
+  const base = { followUpJudgeProvider: '', followUpJudgeModel: '' };
+  assert.deepEqual(resolveFollowUpRoute({ ...base }, host), {
+    provider: 'deepseek-official',
+    model: 'deepseek-flash',
+    reasoningEffort: 'high',
+  });
+  assert.deepEqual(
+    resolveFollowUpRoute({ ...base, followUpJudgeProvider: 'deepseek-official' }, host),
+    { provider: 'deepseek-official', model: 'deepseek-flash', reasoningEffort: 'high' },
+  );
+});
+
 // ────────────────────────── 判定调用 ──────────────────────────
+
+test('runFollowUpJudge：把推理档位透传给 llm.stream', async () => {
+  let seen = null;
+  const llm = {
+    async *stream(options) {
+      seen = options;
+      yield { type: 'text-delta', index: 0, text: '1' };
+      yield { type: 'finish', reason: { kind: 'stop' } };
+    },
+  };
+  await runFollowUpJudge({
+    llm,
+    route: { provider: 'p', model: 'm', reasoningEffort: 'high' },
+    message: '继续',
+    logger: silent,
+  });
+  assert.equal(seen.reasoningEffort, 'high');
+  assert.equal(seen.provider, 'p');
+  assert.equal(seen.model, 'm');
+  // deepseek-flash 会先写 reasoning_content；实测 max_tokens=64 时正文为空、解析必失败。
+  assert.ok(seen.maxTokens >= 512, `maxTokens 太小会只剩思考：${seen.maxTokens}`);
+});
 
 test('runFollowUpJudge：1/0 解析成 true/false', async () => {
   const llm = fakeLlm('1');
@@ -493,6 +533,40 @@ test('门禁：没接 followUp 时行为与旧版一致（只认关键词/@）',
   await feed(guard, later);
   assert.equal(later.mentions.length, 0);
   assert.equal(llmCalls, 0);
+});
+
+test('门禁：判定模型按群会话解析（getRoute 拿到 appId 和群标识）', async () => {
+  const c = clock();
+  const followUp = createFollowUpState({ now: c.now, windowMs: 600_000 });
+  const seen = [];
+  let judgeCalls = 0;
+  const llm = {
+    async *stream() {
+      judgeCalls += 1;
+      yield { type: 'text-delta', index: 0, text: '1' };
+      yield { type: 'finish', reason: { kind: 'stop' } };
+    },
+  };
+  const guard = createGuard(
+    { ...DEFAULT_CONFIG, followUpBurstMs: 0 },
+    silent,
+    new Map(),
+    null,
+    {
+      followUp,
+      getLlm: () => llm,
+      getRoute: (msg) => {
+        seen.push(msg);
+        return { provider: 'p', model: 'm' };
+      },
+    },
+  );
+
+  await feed(guard, makeMsg({ content: '大肥鱼 在吗' }));
+  await feed(guard, makeMsg({ content: '继续刚才的', messageId: 'msg-2' }));
+
+  assert.equal(judgeCalls, 1);
+  assert.deepEqual(seen, [{ appId: 'app-1', groupOpenid: 'group-1' }]);
 });
 
 test('门禁：机器人自己的消息、斜杠命令、空消息都不触发判定', async () => {
@@ -907,6 +981,24 @@ test('runFollowUpSelectJudge：返回编号；答非所问抛错', async () => {
     runFollowUpSelectJudge({ llm: fakeLlm('不好说'), route, items: [{ text: 'a' }], logger: silent }),
     /无法解析/,
   );
+});
+
+test('runFollowUpSelectJudge：输出预算同样留够（reasoning 会吃 token）', async () => {
+  let seen = null;
+  const llm = {
+    async *stream(options) {
+      seen = options;
+      yield { type: 'text-delta', index: 0, text: '1' };
+      yield { type: 'finish', reason: { kind: 'stop' } };
+    },
+  };
+  await runFollowUpSelectJudge({
+    llm,
+    route: { provider: 'p', model: 'm' },
+    items: [{ text: 'a' }, { text: 'b' }],
+    logger: silent,
+  });
+  assert.ok(seen.maxTokens >= 512, `maxTokens 太小会只剩思考：${seen.maxTokens}`);
 });
 
 test('门禁：select 模式只放行被挑中的那条', async () => {

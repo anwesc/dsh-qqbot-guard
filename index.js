@@ -874,6 +874,12 @@ const FOLLOWUP_RECENT_LIMIT = 8;
 const FOLLOWUP_TEXT_LIMIT = 240;
 /** 整个提示词的字数上限（判定只是二分类，不需要长上下文） */
 const FOLLOWUP_PROMPT_LIMIT = 2000;
+/**
+ * 判定调用的输出预算。deepseek-flash 这类模型会先把思考写进 reasoning_content，
+ * max_tokens 太小（实测 64）会被思考吃光、content 为空，解析必然失败；
+ * 给 1024 留足「思考 + 一个字符」的空间，实际仍只输出 1/0。
+ */
+const FOLLOWUP_JUDGE_MAX_TOKENS = 1024;
 const FOLLOWUP_MIN_WINDOW_MS = 60_000;
 const FOLLOWUP_MAX_WINDOW_MS = 24 * 60 * 60_000;
 const FOLLOWUP_DEFAULT_WINDOW_MS = 10 * 60_000;
@@ -1403,15 +1409,23 @@ export function resolveFollowUpRoute(config = {}, getRoute) {
       auto = null;
     }
   }
-  const autoRoute =
-    auto?.provider && auto?.model ? { provider: String(auto.provider), model: String(auto.model) } : null;
+  // 宿主选中的推理档位要一起带上：判定模型和会话模型用同一档，结果才稳定。
+  const normalize = (route) => {
+    if (!route?.provider || !route?.model) return null;
+    const out = { provider: String(route.provider), model: String(route.model) };
+    if (route.reasoningEffort) out.reasoningEffort = route.reasoningEffort;
+    return out;
+  };
+  const autoRoute = normalize(auto);
   if (provider && model) return { provider, model };
   if (!provider && !model) return autoRoute;
   if (provider && !model) {
-    return autoRoute && autoRoute.provider === provider ? { provider, model: autoRoute.model } : null;
+    return autoRoute && autoRoute.provider === provider
+      ? { ...autoRoute, provider, model: autoRoute.model }
+      : null;
   }
   // 只给了 model：只有当它与宿主默认模型同名时才敢沿用宿主的 provider
-  return autoRoute && autoRoute.model === model ? { provider: autoRoute.provider, model } : null;
+  return autoRoute && autoRoute.model === model ? { ...autoRoute, model } : null;
 }
 
 /** 收流：只要文本，末块 finish 报错就抛（与 dsh-llm 的 finish 约定一致） */
@@ -1448,13 +1462,15 @@ async function callFollowUpModel({
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), limit);
   try {
-    const stream = llm.stream({
+    const request = {
       provider: route.provider,
       model: route.model,
       messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
       maxTokens,
       signal: controller.signal,
-    });
+    };
+    if (route.reasoningEffort) request.reasoningEffort = route.reasoningEffort;
+    const stream = llm.stream(request);
     const text = await collectStreamText(stream);
     return { text, route };
   } finally {
@@ -1484,7 +1500,7 @@ export async function runFollowUpJudge({
     route,
     prompt,
     timeoutMs,
-    maxTokens: 64,
+    maxTokens: FOLLOWUP_JUDGE_MAX_TOKENS,
     logger,
     label: '判定',
   });
@@ -1512,7 +1528,7 @@ export async function runFollowUpSelectJudge({
     route,
     prompt,
     timeoutMs,
-    maxTokens: 128,
+    maxTokens: FOLLOWUP_JUDGE_MAX_TOKENS,
     logger,
     label: '挑选',
   });
@@ -1567,7 +1583,7 @@ function rememberGroupMessage(followUp, key, msg, text) {
  * @param {object} [options]
  * @param {object} [options.followUp] createFollowUpState() 的实例；不传 = 不启用续聊
  * @param {() => object} [options.getLlm] 取 dsh 的 llm 服务
- * @param {() => object} [options.getRoute] 取宿主当前模型（agentDefaultModel.currentSelection）
+ * @param {(msg: object) => object} [options.getRoute] 按消息解析这个群会话实际使用的模型
  * @param {object} [options.flood] createFloodGate() 的实例；不传 = 自动建
  */
 export function createGuard(
@@ -1582,10 +1598,14 @@ export function createGuard(
   const followUp = options?.followUp ?? null;
   const getLlm = typeof options?.getLlm === 'function' ? options.getLlm : null;
   const getRoute = typeof options?.getRoute === 'function' ? options.getRoute : null;
+  // 线上没有插件日志可看，把判定调用统计挂到 status 上（/qqbot-guard/config 能直接看到）。
+  const judgeStats = options?.judgeStats ?? null;
 
   // 跨消息状态：批量判定器（短时间多条只问一次）+ 按群串行队列（一条一轮地放行）
   // + 刷屏断路器（短时间大量消息直接静默、或只回挑中的那几条）。
   const turnQueue = createTurnQueue();
+  // 机器人 appId：判定模型要按「这个群会话」的 sessionKey 去取，appId 只能从入站消息上拿。
+  let botAppId = '';
   const flood =
     followUp && options?.flood !== false
       ? options.flood ??
@@ -1611,44 +1631,65 @@ export function createGuard(
    * 逐条判定时为 null（表示「整批同进退」）。
    */
   async function decideFollowUpBurst(items, key) {
-    const cfg = read() ?? DEFAULT_CONFIG;
-    const llm = getLlm ? getLlm() : null;
-    if (!llm?.stream) throw new Error('llm 服务不可用');
-    const route = resolveFollowUpRoute(cfg, getRoute);
-    if (!route) throw new Error('没有可用的判定模型（请配置 followUpJudgeProvider/Model）');
-    const recent = followUp?.get(key)?.recent ?? [];
-    // 刷屏中、或这一批本来就够大：让模型挑出仍然相关的编号，只回这几条。
-    const selectMin = Math.max(2, Math.floor(finiteNumber(cfg.followUpSelectMin, 5)));
-    const useSelect =
-      cfg.followUpFloodAction === 'select' &&
-      (items.length >= selectMin || items.some((it) => it.flooding === true));
-    if (useSelect) {
-      const selected = await runFollowUpSelectJudge({
-        llm,
-        route,
-        recent,
-        items: items.map((it) => ({ text: it.text, sender: it.sender })),
-        timeoutMs: cfg.followUpJudgeTimeoutMs,
-        logger,
-      });
-      return { verdict: selected.length > 0, selected };
+    if (judgeStats) {
+      judgeStats.calls += 1;
+      judgeStats.lastAt = Date.now();
     }
-    const lines = items.map((it) => `${it.sender ? `${it.sender}: ` : ''}${it.text}`);
-    const message =
-      items.length > 1
-        ? `（短时间内连续 ${items.length} 条消息，请整体判断）\n${lines.join('\n')}`
-        : lines[0] ?? '';
-    const verdict = await runFollowUpJudge({
-      llm,
-      route,
-      recent,
-      message,
-      sender: '',
-      quotedBot: items.some((it) => it.quotedBot === true),
-      timeoutMs: cfg.followUpJudgeTimeoutMs,
-      logger,
-    });
-    return { verdict, selected: null };
+    try {
+      const cfg = read() ?? DEFAULT_CONFIG;
+      const llm = getLlm ? getLlm() : null;
+      if (!llm?.stream) throw new Error('llm 服务不可用');
+      // 判定模型跟着「这个群会话」走：qqbot 的模型可能是 per-peer 覆盖、settings.yaml
+      // 或宿主默认，只读 agentDefaultModel 会拿错（群里切过模型时尤其明显）。
+      const route = resolveFollowUpRoute(
+        cfg,
+        getRoute ? () => getRoute({ appId: botAppId, groupOpenid: key }) : null,
+      );
+      if (!route) throw new Error('没有可用的判定模型（请配置 followUpJudgeProvider/Model）');
+      const recent = followUp?.get(key)?.recent ?? [];
+      // 刷屏中、或这一批本来就够大：让模型挑出仍然相关的编号，只回这几条。
+      const selectMin = Math.max(2, Math.floor(finiteNumber(cfg.followUpSelectMin, 5)));
+      const useSelect =
+        cfg.followUpFloodAction === 'select' &&
+        (items.length >= selectMin || items.some((it) => it.flooding === true));
+      let result;
+      if (useSelect) {
+        const selected = await runFollowUpSelectJudge({
+          llm,
+          route,
+          recent,
+          items: items.map((it) => ({ text: it.text, sender: it.sender })),
+          timeoutMs: cfg.followUpJudgeTimeoutMs,
+          logger,
+        });
+        result = { verdict: selected.length > 0, selected };
+      } else {
+        const lines = items.map((it) => `${it.sender ? `${it.sender}: ` : ''}${it.text}`);
+        const message =
+          items.length > 1
+            ? `（短时间内连续 ${items.length} 条消息，请整体判断）\n${lines.join('\n')}`
+            : lines[0] ?? '';
+        const verdict = await runFollowUpJudge({
+          llm,
+          route,
+          recent,
+          message,
+          sender: '',
+          quotedBot: items.some((it) => it.quotedBot === true),
+          timeoutMs: cfg.followUpJudgeTimeoutMs,
+          logger,
+        });
+        result = { verdict, selected: null };
+      }
+      if (judgeStats) judgeStats.lastVerdict = result.verdict ? 'related' : 'unrelated';
+      return result;
+    } catch (err) {
+      if (judgeStats) {
+        judgeStats.errors += 1;
+        judgeStats.lastError = String(err?.message ?? err);
+      }
+      throw err;
+    }
   }
 
   return async function qqbotGuard(ctx, next) {
@@ -1661,6 +1702,7 @@ export function createGuard(
     let released = false;
     try {
       const msg = ctx?.message;
+      if (!botAppId && ctx?.bot?.appId) botAppId = String(ctx.bot.appId);
       if (faces && typeof msg?.content === 'string') {
         const normalized = normalizeFaces(msg.content);
         if (normalized !== msg.content) msg.content = normalized;
@@ -2219,20 +2261,53 @@ export async function apply(ctx, config) {
       return null;
     }
   };
-  const getRoute = () => {
+  // 判定统计：群里看不到日志时，用它判断「到底有没有判、失败了几次」。
+  const judgeStats = { calls: 0, errors: 0, lastError: '', lastVerdict: '', lastAt: 0 };
+  // qqbot 自己的模型解析链：per-peer 覆盖 > 它的配置 > settings.yaml > 宿主默认 > 兜底。
+  // 判定模型跟着群里实际在用的模型走，别只读宿主默认（群里切过模型时会对不上）。
+  let modelResolver = null;
+  try {
+    const sourceDir = qqbotSourceDir(qqbot.dir);
+    const mod = await import(
+      pathToFileURL(join(qqbot.dir, sourceDir, 'model', 'model-resolver.js')).href
+    );
+    if (typeof mod.ModelResolver === 'function') modelResolver = new mod.ModelResolver(ctx, {}, log);
+  } catch (err) {
+    log.warn(`[qqbot-guard] 按会话取判定模型未启用: ${err?.message ?? err}`);
+  }
+
+  const hostRoute = () => {
     try {
       const selection = ctx?.get?.('agentDefaultModel')?.currentSelection?.();
       if (!selection?.provider || !selection?.model) return null;
-      return { provider: selection.provider, model: selection.model };
+      const route = { provider: selection.provider, model: selection.model };
+      if (selection.reasoningEffort) route.reasoningEffort = selection.reasoningEffort;
+      return route;
     } catch {
       return null;
     }
+  };
+
+  const getRoute = (msg) => {
+    const appId = String(msg?.appId ?? '');
+    const peer = String(msg?.groupOpenid ?? msg?.peerId ?? '');
+    if (modelResolver && appId && peer) {
+      try {
+        const route = modelResolver.getEffectiveRoute(`qqbot:${appId}:group:${peer}`);
+        if (route?.provider && route?.model) return route;
+      } catch (err) {
+        log.debug?.(`[qqbot-guard] 按会话解析模型失败，回退宿主默认: ${err?.message ?? err}`);
+      }
+    }
+    // 和 qqbot 的最终兜底保持一致：宿主没有默认模型时，判定也不能凭空哑掉。
+    return hostRoute() ?? { provider: 'deepseek-official', model: 'deepseek-v4-flash' };
   };
 
   const guard = createGuard(() => source.get(), log, notes, mediaDownloader, {
     followUp,
     getLlm,
     getRoute,
+    judgeStats,
   });
   const result = installGuard(sdk.QQBot, guard, log);
   if (!result.installed) {
@@ -2252,6 +2327,16 @@ export async function apply(ctx, config) {
   Object.defineProperty(status, 'followUpWindows', {
     enumerable: true,
     get: () => followUp.size(),
+  });
+  Object.defineProperty(status, 'followUpJudge', {
+    enumerable: true,
+    get: () => ({
+      calls: judgeStats.calls,
+      errors: judgeStats.errors,
+      lastError: judgeStats.lastError,
+      lastVerdict: judgeStats.lastVerdict,
+      lastAt: judgeStats.lastAt,
+    }),
   });
 
   let historyPatched = false;
@@ -2282,14 +2367,14 @@ export async function apply(ctx, config) {
 
   if (cfg.verbose) {
     const cfgFile = resolveConfigFile(cfg);
-    const route = getRoute();
+    const route = hostRoute();
     log.info(
       `[qqbot-guard] 就绪：qqbot=${qqbot.pkg?.version ?? '?'} sdk=${sdkInfo.version ?? '?'} ` +
         `triggers=${JSON.stringify(cfg.triggers)} 配置源=${existsSync(cfgFile ?? '') ? cfgFile : 'cordis/默认'} ` +
         `表情=${cfg.faces !== false ? '开' : '关'} 历史附件=${historyPatched ? '开' : '关'} ` +
         `续聊=${cfg.followUpEnabled === false ? '关' : `${cfg.followUpWindowMinutes ?? 10}分钟/上限${cfg.followUpMaxTurns || '不限'}`} ` +
         `引用=${cfg.followUpQuoteReply === true ? '开' : '关'} ` +
-        `判定模型=${cfg.followUpJudgeProvider ? `${cfg.followUpJudgeProvider}/${cfg.followUpJudgeModel || '?'}` : route ? `${route.provider}/${route.model}（宿主）` : '无'} ` +
+        `判定模型=${cfg.followUpJudgeProvider ? `${cfg.followUpJudgeProvider}/${cfg.followUpJudgeModel || '?'}` : modelResolver ? `${route ? `${route.provider}/${route.model}` : 'qqbot 默认链'}（按群会话解析）` : route ? `${route.provider}/${route.model}（宿主）` : '无'} ` +
         `注入方式=lazy-unshift + 伪造 mentions（与加载顺序无关）`,
     );
   }
