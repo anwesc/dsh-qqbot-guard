@@ -129,6 +129,17 @@ export const DEFAULT_CONFIG = {
    * 平台不接受时自动退回普通发送。合并回复不带引用框。
    */
   followUpQuoteReply: true,
+  /**
+   * 话题锚点：开窗后让判定模型顺带起一句 15 字以内的话题，之后每 6 轮刷新。
+   * 判定时把 `[当前话题]` 放在最前面，模型才分得清「还在聊」和「换话题了」。
+   * 每个窗口只多一次小调用（不阻塞判定），判定不准时可以关掉。
+   */
+  followUpTopicAnchor: true,
+  /**
+   * 人工纠正样本（设置页「判定记录」里点「该回 / 不该回」写入），最多 5 条。
+   * 判定时作为 few-shot 拼进提示词，让模型照着你改过的口径走；存 JSON 配置里，重启不丢。
+   */
+  followUpJudgeExamples: [],
   /** 是否输出诊断日志 */
   verbose: true,
 };
@@ -213,6 +224,7 @@ const BOOLEAN_KEYS = [
   'followUpEnabled',
   'followUpQuoteReply',
   'followUpAckFastPath',
+  'followUpTopicAnchor',
   'followUpStickerEnabled',
   'verbose',
   'strictVersion',
@@ -235,6 +247,20 @@ export function sanitizeConfigPatch(input) {
     if (!Array.isArray(input.triggers)) throw new Error('triggers 必须是字符串数组');
     const list = input.triggers.map((t) => String(t ?? '').trim()).filter(Boolean);
     out.triggers = [...new Set(list)];
+  }
+  // 人工纠正样本：设置页点「该回 / 不该回」写进来，判定时当 few-shot 用
+  if (Object.hasOwn(input, 'followUpJudgeExamples')) {
+    if (!Array.isArray(input.followUpJudgeExamples)) {
+      throw new Error('followUpJudgeExamples 必须是数组');
+    }
+    const list = input.followUpJudgeExamples
+      .slice(0, 5)
+      .map((e) => ({
+        text: String(e?.text ?? '').replace(/\s+/g, ' ').trim().slice(0, 120),
+        verdict: e?.verdict === 'reply' ? 'reply' : 'ignore',
+      }))
+      .filter((e) => e.text);
+    out.followUpJudgeExamples = list;
   }
   if (Object.hasOwn(input, 'historyMediaMaxMB')) {
     const mb = Number(input.historyMediaMaxMB);
@@ -907,12 +933,18 @@ function markMention(msg, extra = {}) {
 
 // ────────────────────────── 续聊窗口 ──────────────────────────
 
-/** 判定器最多看到几条最近消息（含机器人自己的发言） */
-const FOLLOWUP_RECENT_LIMIT = 8;
+/** 判定器最多看到几条最近消息（含机器人自己的发言，以及被判为无关的群聊） */
+const FOLLOWUP_RECENT_LIMIT = 12;
 /** 单条消息进提示词时最多留多少字，防止一条长文吃光预算 */
 const FOLLOWUP_TEXT_LIMIT = 240;
+/** 被判为无关的消息只留一小段，够让模型看出「群里已经跑题」就行 */
+const FOLLOWUP_IGNORED_TEXT_LIMIT = 120;
 /** 整个提示词的字数上限（判定只是二分类，不需要长上下文） */
-const FOLLOWUP_PROMPT_LIMIT = 2000;
+const FOLLOWUP_PROMPT_LIMIT = 3000;
+/** 话题锚点每接几条消息刷新一次（0 = 不刷新，只在开窗时生成） */
+const FOLLOWUP_TOPIC_REFRESH_TURNS = 6;
+/** 判定记录环形缓冲保留多少条（设置页只看最近 20 条） */
+const FOLLOWUP_JUDGE_HISTORY_LIMIT = 50;
 /**
  * 判定调用的输出预算。deepseek-flash 这类模型会先把思考写进 reasoning_content，
  * max_tokens 太小（实测 64）会被思考吃光、content 为空，解析必然失败；
@@ -1189,6 +1221,10 @@ export function createFollowUpState(options = {}) {
       /** 合并回复用的「本条回复不带引用框」标记，值是消息 id */
       quoteSuppressId: '',
       trigger: String(info.trigger ?? ''),
+      /** 开窗时由判定模型生成的一句话话题，判定时贴在提示词顶部当锚点 */
+      topic: '',
+      /** 生成话题时的轮次，用来决定隔几条刷新一次 */
+      topicTurn: -1,
       recent: [],
     };
     windows.set(k, win);
@@ -1249,7 +1285,9 @@ export function createFollowUpState(options = {}) {
   function remember(key, entry = {}) {
     const win = get(key);
     if (!win) return false;
-    const text = String(entry.text ?? '').replace(/\s+/g, ' ').trim().slice(0, FOLLOWUP_TEXT_LIMIT);
+    const ignored = entry.ignored === true;
+    const limit = ignored ? FOLLOWUP_IGNORED_TEXT_LIMIT : FOLLOWUP_TEXT_LIMIT;
+    const text = String(entry.text ?? '').replace(/\s+/g, ' ').trim().slice(0, limit);
     if (!text) return false;
     win.recent.push({
       role: entry.role === 'bot' ? 'bot' : 'user',
@@ -1257,9 +1295,34 @@ export function createFollowUpState(options = {}) {
       text,
       at: finiteNumber(entry.at, now()),
       refIdx: String(entry.refIdx ?? ''),
+      ignored,
     });
     if (win.recent.length > recentLimit) win.recent.splice(0, win.recent.length - recentLimit);
     return true;
+  }
+
+  /**
+   * 记一条「判过、但决定不回」的消息：它仍然留在上下文里（标记 ignored），
+   * 这样模型下次能看到群里已经聊到别处去了，而不是只看见自己接过的话。
+   */
+  function rememberIgnored(key, entry = {}) {
+    return remember(key, { ...entry, ignored: true });
+  }
+
+  /** 判定模型给的一句话话题；turn 记「是在第几轮生成的」，用来决定隔几条刷新 */
+  function setTopic(key, topic, turn) {
+    const win = get(key);
+    if (!win) return false;
+    const text = String(topic ?? '').replace(/\s+/g, ' ').trim().slice(0, 60);
+    if (!text) return false;
+    win.topic = text;
+    win.topicTurn = finiteNumber(turn, win.turns);
+    return true;
+  }
+
+  function topic(key) {
+    const win = get(key);
+    return win ? { text: win.topic, turn: win.topicTurn } : null;
   }
 
   function recent(key) {
@@ -1303,6 +1366,9 @@ export function createFollowUpState(options = {}) {
     renew,
     close,
     remember,
+    rememberIgnored,
+    setTopic,
+    topic,
     recent,
     matchesBotRef,
     suppressQuote,
@@ -1624,40 +1690,66 @@ function quotedBotInfo(msg, appId, isBotRef) {
 
 const FOLLOWUP_JUDGE_RULES = [
   '你在判断一个 QQ 群的对话场景还在不在继续，而不是判断「这句话有没有直接对机器人说」。',
-  '机器人已经参与了这个群的一场对话；下面给出它最近说的话和最近的群聊。',
+  '机器人已经参与了这个群的一场对话；下面给出当前话题、它最近说的话和最近的群聊。',
+  '标着 [已忽略] 的消息是判过、但决定不回的——它们帮你看出群里是不是已经聊到别处去了。',
   '按三档判断新消息：',
   '- 2：仍在这场对话里，值得接一句（追问、补充、反驳、接着机器人或群友刚说的事、请机器人帮忙）；',
   '- 1：属于这场对话的现场反应（「哈哈哈」「笑死」「确实」「+1」「收到」「嗯」「好的」、纯表情、附和、打招呼），但不必单独回；',
   '- 0：另一个话题、广告、公告、红包、刷屏，或看不出关联。',
   '注意：群友之间接着聊同一个话题也算 2；不要因为「不是对机器人说的」就判 0。',
-  '如果判 1，可以再补一个情绪词（能一眼看出来才写，拿不准就不写）：',
-  '- happy / speechless / melon / shock / cry / like / lazy / question / sleep，用来挑一张贴合的表情。',
-  '如果判 2，再给一个回复形态：',
+  '反过来，即使提到了机器人，只要明显换到了 [当前话题] 之外的事，也判 0。',
+  '先只决定档位。判 2 时，再在下一行补回复形态：',
   '- m：这几条是同一话题的连续补充/追问，一条回复就能讲完；',
-  '- e：它们各自是独立的问题或请求，需要分别回复；',
-  '- 拿不准就输出 e（宁可多回一条，也不要漏答）。',
-  '只输出下面几种之一，不要解释，不要加代码块：',
-  '- 2m 或 2e：要回，合并成一条 / 分开回；',
-  '- 1 或 1 <情绪>：场景内但不用回；',
-  '- 0：无关。',
+  '- e：它们各自是独立的问题或请求，需要分别回复；拿不准就写 e。',
+  '判 1 时，可以在同一行补一个情绪词（能一眼看出来才写，拿不准就不写）：',
+  '- happy / speechless / melon / shock / cry / like / lazy / question / sleep，用来挑一张贴合的表情。',
+  '输出最多两行，不要解释，不要加代码块：',
+  '- 第一行：2 或 1 或 0；',
+  '- 第二行：只有第一行是 2 时才写 m 或 e。',
 ].join('\n');
 
 /**
  * 拼判定器的单条用户消息。
  * dsh-llm 的 request-only 输入只支持 user 角色，所以系统规则也塞进同一条消息里，
  * 不依赖 createSystemMessage（本插件零依赖，拿不到 dsh-llm 的构造函数）。
+ * 超出预算时从最旧的消息开始丢，但保留「机器人最后一句」——否则模型不知道在接什么。
  */
-export function buildFollowUpJudgeInput({ recent = [], message = '', sender = '', quotedBot = false } = {}) {
-  const lines = [];
+export function buildFollowUpJudgeInput({
+  recent = [],
+  message = '',
+  sender = '',
+  quotedBot = false,
+  topic = '',
+} = {}) {
+  const entries = [];
+  let prevAt = 0;
+  let lastBotText = '';
   for (const entry of recent) {
     if (!entry?.text) continue;
+    const at = finiteNumber(entry.at, 0);
+    const delta = at && prevAt ? Math.max(0, Math.round((at - prevAt) / 1000)) : 0;
+    if (at) prevAt = at;
     const who = entry.role === 'bot' ? '机器人' : entry.name || '群友';
-    lines.push(`${who}: ${entry.text}`);
+    const tag = entry.ignored ? '[已忽略] ' : '';
+    entries.push({ line: `${tag}${who} (+${delta}s): ${entry.text}`, bot: entry.role === 'bot' });
+    if (entry.role === 'bot') lastBotText = entry.text;
   }
-  const head = lines.length > 0 ? `[最近群聊]\n${lines.join('\n')}\n\n` : '';
-  const quoteNote = quotedBot ? '（引用了机器人的发言）' : '';
-  const body = `${head}[新消息] ${quoteNote}${sender ? `${sender}: ` : ''}${message}`;
-  return body.length > FOLLOWUP_PROMPT_LIMIT ? body.slice(body.length - FOLLOWUP_PROMPT_LIMIT) : body;
+  const newLine = `[新消息] ${quotedBot ? '（引用了机器人的发言）' : ''}${
+    sender ? `${sender}: ` : ''
+  }${message}`;
+  const topicLine = topic ? `[当前话题] ${topic}\n` : '';
+  // 反向装填：从最新一条往前塞，装不下就停，天然保住「离新消息最近」的上下文
+  const kept = [];
+  let budget = FOLLOWUP_PROMPT_LIMIT - newLine.length - topicLine.length - 24;
+  for (let i = entries.length - 1; i >= 0; i -= 1) {
+    if (entries[i].line.length + 1 > budget) break;
+    kept.unshift(entries[i].line);
+    budget -= entries[i].line.length + 1;
+  }
+  const botKept = entries.some((e) => e.bot) && kept.some((line) => line.includes(lastBotText));
+  const pin = lastBotText && !botKept ? `[机器人最后一句] ${lastBotText}\n\n` : '';
+  const head = kept.length > 0 ? `[最近群聊]\n${kept.join('\n')}\n\n` : '';
+  return `${topicLine}${pin}${head}${newLine}`;
 }
 
 const FOLLOWUP_SELECT_RULES = [
@@ -1922,10 +2014,19 @@ export async function runFollowUpJudge({
   message = '',
   sender = '',
   quotedBot = false,
+  topic = '',
+  examples = [],
   timeoutMs = 6000,
   logger = console,
 } = {}) {
-  const prompt = `${FOLLOWUP_JUDGE_RULES}\n\n${buildFollowUpJudgeInput({ recent, message, sender, quotedBot })}`;
+  const fewShot = buildJudgeExamplesPrompt(examples);
+  const prompt = `${FOLLOWUP_JUDGE_RULES}${fewShot ? `\n\n${fewShot}` : ''}\n\n${buildFollowUpJudgeInput({
+    recent,
+    message,
+    sender,
+    quotedBot,
+    topic,
+  })}`;
   const { text } = await callFollowUpModel({
     llm,
     route,
@@ -1941,6 +2042,72 @@ export async function runFollowUpJudge({
     decision.action === 'reply' ? (decision.mode === 'merge' ? '2m' : '2e') : decision.action === 'ack' ? '1' : '0';
   logger.debug?.(`[qqbot-guard] 判定 ${route.provider}/${route.model} → ${shown}`);
   return decision;
+}
+
+const FOLLOWUP_TOPIC_RULES = [
+  '你在给一段 QQ 群聊起话题标签。',
+  '用不超过 15 个汉字概括「现在大家在聊什么」，只输出话题本身。',
+  '不要标点、不要引号、不要解释；看不出话题就输出：闲聊。',
+].join('\n');
+
+/** 话题输入只带最近几句，够模型抓关键词就行 */
+export function buildFollowUpTopicInput({ recent = [], message = '', sender = '' } = {}) {
+  const lines = [];
+  for (const entry of recent.slice(-6)) {
+    if (!entry?.text) continue;
+    const who = entry.role === 'bot' ? '机器人' : entry.name || '群友';
+    lines.push(`${who}: ${entry.text.slice(0, 80)}`);
+  }
+  lines.push(`[新消息] ${sender ? `${sender}: ` : ''}${String(message ?? '').slice(0, 160)}`);
+  return lines.join('\n');
+}
+
+/**
+ * 人工纠正样本：设置页点「该回 / 不该回」攒下来的 few-shot。
+ * 只放结论不放理由——小模型模仿结论比模仿解释稳。
+ */
+export function buildJudgeExamplesPrompt(examples = []) {
+  const rows = (Array.isArray(examples) ? examples : [])
+    .slice(0, 5)
+    .filter((e) => e && typeof e.text === 'string' && e.text.trim());
+  if (rows.length === 0) return '';
+  const lines = ['[人工纠正过的口径，和新消息冲突时按这个判]'];
+  for (const e of rows) {
+    lines.push(`- 「${String(e.text).trim().slice(0, 120)}」→ ${e.verdict === 'reply' ? '2（该回）' : '0（不该回）'}`);
+  }
+  return lines.join('\n');
+}
+
+/**
+ * 生成一句话话题锚点。调用成本和一次判定同量级（小模型几百 token），
+ * 每个窗口只生成一次、之后每 6 轮刷新一次，用来把「还在不在这个话题里」变成可判断的问题。
+ */
+export async function runFollowUpTopic({
+  llm,
+  route,
+  recent = [],
+  message = '',
+  sender = '',
+  timeoutMs = 6000,
+  logger = console,
+} = {}) {
+  const prompt = `${FOLLOWUP_TOPIC_RULES}\n\n${buildFollowUpTopicInput({ recent, message, sender })}`;
+  const { text } = await callFollowUpModel({
+    llm,
+    route,
+    prompt,
+    timeoutMs,
+    maxTokens: FOLLOWUP_JUDGE_MAX_TOKENS,
+    logger,
+    label: '话题',
+  });
+  const topic = String(text ?? '')
+    .replace(/[\s"'“”「」《》]+/g, '')
+    .replace(/^话题[:：]/, '')
+    .slice(0, 24);
+  if (!topic) throw new Error('话题模型返回空');
+  logger.debug?.(`[qqbot-guard] 话题 → ${topic}`);
+  return topic;
 }
 
 /**
@@ -2003,6 +2170,21 @@ function rememberGroupMessage(followUp, key, msg, text) {
 }
 
 /**
+ * 判过、决定不回的消息也记一笔（标记 ignored）：窗口里只留「接过的话」时，
+ * 模型看不出群里已经跑题；带上这些消息才分得清「还在聊」和「换了话题」。
+ */
+function rememberIgnoredMessage(followUp, key, msg, text) {
+  if (!followUp?.rememberIgnored) return false;
+  const attachments = summarizeAttachments(msg?.attachments);
+  return followUp.rememberIgnored(key, {
+    role: 'user',
+    name: msg?.senderName ?? msg?.senderId ?? '',
+    text: text || attachments,
+    at: Date.now(),
+  });
+}
+
+/**
  * 真正的门禁逻辑。挂在中间件链头部，做三件事：
  * 1. 正文里的表情标签换成可读文本（历史与当前消息都受益）；
  * 2. 群聊命中关键词时给 `msg.mentions` 补 `{ is_you: true }`，让下游 mentionGate
@@ -2042,6 +2224,29 @@ export function createGuard(
   // 跨消息状态：批量判定器（短时间多条只问一次）+ 按群串行队列（一条一轮地放行）
   // + 刷屏断路器（短时间大量消息直接静默、或只回挑中的那几条）。
   const turnQueue = createTurnQueue();
+  // 正在生成话题的群：避免同一窗口并发起好几次话题调用
+  const topicPending = new Set();
+
+  /** 记一条判定结果（设置页「判定记录」用，也是批量调 prompt 的素材） */
+  function recordJudge(groupKey, items, result) {
+    if (!judgeStats) return;
+    if (!Array.isArray(judgeStats.recent)) judgeStats.recent = [];
+    const text = items
+      .map((it) => `${it.sender ? `${it.sender}: ` : ''}${it.text}`)
+      .join(' / ')
+      .slice(0, 160);
+    judgeStats.recent.push({
+      id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+      at: Date.now(),
+      group: String(groupKey ?? '').slice(-6),
+      text,
+      verdict: result.action,
+      mode: result.mode ?? null,
+    });
+    if (judgeStats.recent.length > FOLLOWUP_JUDGE_HISTORY_LIMIT) {
+      judgeStats.recent.splice(0, judgeStats.recent.length - FOLLOWUP_JUDGE_HISTORY_LIMIT);
+    }
+  }
   // 机器人 appId：判定模型要按「这个群会话」的 sessionKey 去取，appId 只能从入站消息上拿。
   let botAppId = '';
   const flood =
@@ -2087,13 +2292,15 @@ export function createGuard(
       }
       if (ackMode === 'renew' && cfg.followUpAckFastPath !== false) {
         if (judgeStats) judgeStats.lastAt = Date.now();
-        return {
+        const ack = {
           action: 'ack',
           verdict: false,
           mode: null,
           selected: null,
           mood: guessStickerMoodFromItems(items),
         };
+        recordJudge(key, items, ack);
+        return ack;
       }
     }
     if (judgeStats) {
@@ -2111,6 +2318,37 @@ export function createGuard(
       );
       if (!route) throw new Error('没有可用的判定模型（请配置 followUpJudgeProvider/Model）');
       const recent = followUp?.get(key)?.recent ?? [];
+      // 话题锚点：开窗后第一次判定前先生成，之后每 6 轮刷新。不阻塞这次判定——
+      // 生成好了下一次就带上，少给用户加一次模型往返的等待。
+      const win = followUp?.get(key) ?? null;
+      const topicInfo = followUp?.topic?.(key) ?? null;
+      if (
+        win &&
+        followUp?.setTopic &&
+        cfg.followUpTopicAnchor !== false &&
+        !topicPending.has(key) &&
+        (!topicInfo?.text || win.turns - topicInfo.turn >= FOLLOWUP_TOPIC_REFRESH_TURNS)
+      ) {
+        topicPending.add(key);
+        const topicText = items
+          .map((it) => `${it.sender ? `${it.sender}: ` : ''}${it.text}`)
+          .join('\n');
+        Promise.resolve()
+          .then(() =>
+            runFollowUpTopic({
+              llm,
+              route,
+              recent,
+              message: topicText,
+              sender: '',
+              timeoutMs: cfg.followUpJudgeTimeoutMs,
+              logger,
+            }),
+          )
+          .then((text) => followUp.setTopic(key, text, win.turns))
+          .catch((err) => logger.debug?.(`[qqbot-guard] 话题生成失败（忽略）: ${err?.message ?? err}`))
+          .finally(() => topicPending.delete(key));
+      }
       // 刷屏中、或这一批本来就够大：让模型挑出仍然相关的编号，只回这几条。
       const selectMin = Math.max(2, Math.floor(finiteNumber(cfg.followUpSelectMin, 5)));
       const useSelect =
@@ -2145,6 +2383,8 @@ export function createGuard(
           message,
           sender: '',
           quotedBot: items.some((it) => it.quotedBot === true),
+          topic: topicInfo?.text ?? '',
+          examples: cfg.followUpJudgeExamples,
           timeoutMs: cfg.followUpJudgeTimeoutMs,
           logger,
         });
@@ -2157,6 +2397,7 @@ export function createGuard(
       if (judgeStats) {
         judgeStats.lastVerdict =
           result.action === 'reply' ? 'related' : result.action === 'ack' ? 'ack' : 'unrelated';
+        recordJudge(key, items, result);
       }
       return result;
     } catch (err) {
@@ -2413,6 +2654,7 @@ export function createGuard(
                     if (picked && !picked.includes(me)) {
                       // select 模式里没被挑中：静默丢弃，不交给下游
                       released = true;
+                      rememberIgnoredMessage(followUp, groupKey, msg, text);
                       logger.debug?.(
                         `[qqbot-guard] 刷屏挑选：第 ${me}/${outcome.count} 条未被选中，不回`,
                       );
@@ -2472,6 +2714,7 @@ export function createGuard(
                       await release('judge');
                     }
                   } else {
+                    rememberIgnoredMessage(followUp, groupKey, msg, text);
                     logger.debug?.(
                       `[qqbot-guard] 续聊判定=无关（批 ${outcome.count} 条），交给 mentionGate 拦停`,
                     );
@@ -2938,6 +3181,8 @@ export async function apply(ctx, config) {
       lastError: judgeStats.lastError,
       lastVerdict: judgeStats.lastVerdict,
       lastAt: judgeStats.lastAt,
+      // 最近 10 条判定：设置页「判定记录」直接读它
+      recent: Array.isArray(judgeStats.recent) ? judgeStats.recent.slice(-10) : [],
     }),
   });
 

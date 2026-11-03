@@ -18,6 +18,7 @@ import {
   createTurnQueue,
   buildFollowUpJudgeInput,
   buildFollowUpSelectInput,
+  buildJudgeExamplesPrompt,
   guessStickerMood,
   guessStickerMoodFromItems,
   installOutboundRecorder,
@@ -29,6 +30,7 @@ import {
   resolveFollowUpRoute,
   runFollowUpJudge,
   runFollowUpSelectJudge,
+  runFollowUpTopic,
   sanitizeConfigPatch,
 } from './index.js';
 
@@ -199,8 +201,9 @@ test('buildFollowUpJudgeInput：带最近发言、发送者与引用标记', () 
     quotedBot: true,
   });
   assert.ok(text.includes('[最近群聊]'));
-  assert.ok(text.includes('小明: 这个报错怎么办'));
-  assert.ok(text.includes('机器人: 先看日志'));
+  // 每条带「距上一条多少秒」，让模型能看出隔了多久
+  assert.ok(text.includes('小明 (+0s): 这个报错怎么办'));
+  assert.ok(text.includes('机器人 (+0s): 先看日志'));
   assert.ok(text.includes('[新消息] （引用了机器人的发言）小红: 日志在哪'));
 });
 
@@ -214,8 +217,64 @@ test('buildFollowUpJudgeInput：超长时保留末尾（新消息不能丢）', 
     message: '末尾这句一定要在',
     sender: '小明',
   });
-  assert.ok(text.length <= 2000);
+  assert.ok(text.length <= 3000);
   assert.ok(text.endsWith('末尾这句一定要在'));
+});
+
+test('buildFollowUpJudgeInput：话题锚点 + 相对时间 + 已忽略标记', () => {
+  const text = buildFollowUpJudgeInput({
+    recent: [
+      { role: 'user', name: '小明', text: '这个报错怎么办', at: 1_000 },
+      { role: 'bot', text: '先看日志', at: 13_000 },
+      { role: 'user', name: '老王', text: '晚上吃啥', at: 43_000, ignored: true },
+    ],
+    message: '日志在哪',
+    topic: '报错排查',
+  });
+  assert.ok(text.startsWith('[当前话题] 报错排查'));
+  assert.ok(text.includes('小明 (+0s): 这个报错怎么办'));
+  assert.ok(text.includes('机器人 (+12s): 先看日志'));
+  assert.ok(text.includes('[已忽略] 老王 (+30s): 晚上吃啥'));
+});
+
+test('buildFollowUpJudgeInput：丢旧消息时保住机器人最后一句', () => {
+  const recent = [
+    { role: 'bot', text: '这条是机器人的话', at: 1_000 },
+    ...Array.from({ length: 20 }, (_, i) => ({
+      role: 'user',
+      name: '刷屏',
+      text: `${i}-${'背'.repeat(200)}`,
+      at: 2_000 + i,
+    })),
+  ];
+  const text = buildFollowUpJudgeInput({ recent, message: '末尾这句' });
+  assert.ok(text.includes('[机器人最后一句] 这条是机器人的话'));
+  assert.ok(text.endsWith('末尾这句'));
+  assert.ok(text.length <= 3000 + 40); // pin 行可能把结果顶出一点点，但不会无界
+});
+
+test('buildJudgeExamplesPrompt：空输入不产生提示，非空按口径列出', () => {
+  assert.equal(buildJudgeExamplesPrompt([]), '');
+  assert.equal(buildJudgeExamplesPrompt(undefined), '');
+  const text = buildJudgeExamplesPrompt([
+    { text: '这不算跑题', verdict: 'reply' },
+    { text: '广告别接', verdict: 'ignore' },
+  ]);
+  assert.ok(text.includes('[人工纠正过的口径'));
+  assert.ok(text.includes('「这不算跑题」→ 2（该回）'));
+  assert.ok(text.includes('「广告别接」→ 0（不该回）'));
+});
+
+test('runFollowUpTopic：去掉引号空白，只留一句话题', async () => {
+  const topic = await runFollowUpTopic({
+    llm: fakeLlm('  「报错排查」  '),
+    route: { provider: 'p', model: 'm' },
+  });
+  assert.equal(topic, '报错排查');
+  await assert.rejects(
+    runFollowUpTopic({ llm: fakeLlm('   '), route: { provider: 'p', model: 'm' } }),
+    /话题模型返回空/,
+  );
 });
 
 // ────────────────────────── 模型路由 ──────────────────────────
@@ -427,7 +486,8 @@ function guarded(followUp, over = {}, extras = {}) {
     },
   };
   const guard = createGuard(
-    { ...DEFAULT_CONFIG, ...over },
+    // 判定记录里的话题锚点会多一次模型调用，这里关掉，调用次数才可数
+    { ...DEFAULT_CONFIG, followUpTopicAnchor: false, ...over },
     silent,
     new Map(),
     null,
@@ -539,7 +599,12 @@ test('门禁：判定失败按 followUpOnJudgeError 处理，连续 3 次关窗'
     },
   };
   const mk = (policy) =>
-    createGuard({ ...DEFAULT_CONFIG, followUpOnJudgeError: policy }, silent, new Map(), null, {
+    createGuard(
+      { ...DEFAULT_CONFIG, followUpTopicAnchor: false, followUpOnJudgeError: policy },
+      silent,
+      new Map(),
+      null,
+      {
       followUp,
       getLlm: () => broken,
       getRoute: () => ({ provider: 'p', model: 'm' }),
@@ -597,7 +662,7 @@ test('门禁：判定模型按群会话解析（getRoute 拿到 appId 和群标�
     },
   };
   const guard = createGuard(
-    { ...DEFAULT_CONFIG, followUpBurstMs: 0 },
+    { ...DEFAULT_CONFIG, followUpBurstMs: 0, followUpTopicAnchor: false },
     silent,
     new Map(),
     null,
@@ -1121,7 +1186,8 @@ test('门禁：followUpAckMode=ignore 时附着完全不理会（不续期、不
   assert.equal(harness.judgeCalls(), 0);
   assert.equal(ack.mentions.length, 0);
   assert.equal(followUp.stats('group-1').lastRelatedAt, before.lastRelatedAt, 'ignore 不该续期');
-  assert.equal(followUp.recent('group-1').at(-1).text, '大肥鱼 在吗');
+  // 不过期、不判定，但这条消息会以 [已忽略] 留在上下文里（不续期）
+  assert.equal(followUp.recent('group-1').at(-1).text, '收到');
 });
 
 test('门禁：强制 batch / each 覆盖模型给的形态', async () => {
@@ -1410,4 +1476,42 @@ test('批量窗口：续约式结算，但受最长等待硬上限约束', async
   assert.equal(sanitizeConfigPatch({ followUpBurstMaxWaitMs: 1000 }).followUpBurstMaxWaitMs, 1000);
   assert.throws(() => sanitizeConfigPatch({ followUpBurstMaxWaitMs: 500 }), /1000~20000/);
   assert.throws(() => sanitizeConfigPatch({ followUpBurstMaxWaitMs: 20001 }), /1000~20000/);
+});
+
+test('门禁：判定进环形缓冲；话题锚点每窗口一次且拼进下一轮提示词', async () => {
+  const followUp = createFollowUpState({ windowMs: 600_000 });
+  const judgeStats = { calls: 0, errors: 0, lastError: '', lastVerdict: '', lastAt: 0 };
+  const prompts = [];
+  let topicCalls = 0;
+  const llm = {
+    async *stream(options) {
+      const raw = options?.messages?.[0]?.content;
+      const text = typeof raw === 'string' ? raw : JSON.stringify(raw ?? '');
+      prompts.push(text);
+      if (text.includes('话题标签')) {
+        topicCalls += 1;
+        yield { type: 'text-delta', index: 0, text: '报错排查' };
+      } else {
+        yield { type: 'text-delta', index: 0, text: '2e' };
+      }
+      yield { type: 'finish', reason: { kind: 'stop' } };
+    },
+  };
+  const guard = createGuard({ ...DEFAULT_CONFIG, followUpBurstMs: 0 }, silent, new Map(), null, {
+    followUp,
+    getLlm: () => llm,
+    getRoute: () => ({ provider: 'p', model: 'm' }),
+    judgeStats,
+  });
+
+  await feed(guard, makeMsg({ content: '大肥鱼 在吗' }));
+  await feed(guard, makeMsg({ content: '报错又来了', messageId: 'm2' }));
+  // 话题是后台生成，等它落地
+  await new Promise((r) => setTimeout(r, 60));
+  await feed(guard, makeMsg({ content: '日志在哪', messageId: 'm3' }));
+
+  assert.equal(topicCalls, 1, '同一个窗口只生成一次话题');
+  assert.equal(judgeStats.recent.length, 2);
+  assert.equal(judgeStats.recent[0].verdict, 'reply');
+  assert.ok(prompts.some((p) => p.includes('[当前话题] 报错排查')));
 });

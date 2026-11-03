@@ -48,6 +48,19 @@ window.__ModuleLoader__.load({
       groupSticker: '附和表情',
       groupFlood: '刷屏保护',
       groupJudge: '判定模型与失败策略',
+      groupHistory: '判定记录',
+      historyEmpty: '还没有判定记录。群里有消息触发续聊后，这里会显示最近 10 次判定。',
+      historyHint: '判错了就点一下：纠正会当作例子带进下一次判定（最多 5 条，跟插件配置一起保存）。',
+      historyCount: '条记录',
+      corrTag: '已纠正',
+      corrReply: '该回',
+      corrIgnore: '不该回',
+      corrRemove: '移除',
+      verdictReply: '该回',
+      verdictAck: '围观',
+      verdictIgnore: '不回',
+      topicAnchor: '话题锚点',
+      topicAnchorHint: '开窗时让模型用一句话概括当前话题，判定时带上它；群里换了话题更容易判 0。',
       cardWake: '唤醒与开关',
       cardHandling: '消息处理',
       restartTag: '需重启',
@@ -172,6 +185,19 @@ window.__ModuleLoader__.load({
       groupSticker: 'Reaction stickers',
       groupFlood: 'Flood protection',
       groupJudge: 'Judge model & failures',
+      groupHistory: 'Judge log',
+      historyEmpty: 'No decisions yet. Once a message opens a follow-up window, the last 10 decisions show up here.',
+      historyHint: 'Wrong call? Tap to correct it; corrections ride along as examples (up to 5, saved with the plugin config).',
+      historyCount: 'decisions',
+      corrTag: 'Corrected',
+      corrReply: 'Reply',
+      corrIgnore: 'Skip',
+      corrRemove: 'Remove',
+      verdictReply: 'reply',
+      verdictAck: 'ack',
+      verdictIgnore: 'skip',
+      topicAnchor: 'Topic anchor',
+      topicAnchorHint: 'Summarize the current topic when a window opens and feed it to the judge, so a change of subject is easier to skip.',
       cardWake: 'Wake-up & keywords',
       cardHandling: 'Message handling',
       restartTag: 'restart',
@@ -393,6 +419,55 @@ window.__ModuleLoader__.load({
         opacity: 0.85,
       },
 
+      judgeRow: {
+        display: 'flex',
+        alignItems: 'flex-start',
+        gap: 8,
+        padding: '7px 0',
+        borderTop: `1px solid ${BORDER}`,
+      },
+      judgeTime: {
+        flex: '0 0 auto',
+        paddingTop: 2,
+        fontSize: 11,
+        opacity: 0.5,
+        fontVariantNumeric: 'tabular-nums',
+      },
+      judgeText: {
+        flex: '1 1 auto',
+        minWidth: 0,
+        fontSize: 12.5,
+        lineHeight: 1.5,
+        overflow: 'hidden',
+        textOverflow: 'ellipsis',
+        whiteSpace: 'nowrap',
+      },
+      judgeActions: { flex: '0 0 auto', display: 'flex', gap: 6 },
+      verdict: {
+        flex: '0 0 auto',
+        padding: '1px 6px',
+        borderRadius: 6,
+        fontSize: 11,
+        background: 'rgba(127,127,127,.14)',
+        opacity: 0.85,
+        whiteSpace: 'nowrap',
+      },
+      verdictReply: {
+        background: 'rgba(64,160,96,.16)',
+        color: 'rgba(64,160,96,.95)',
+        opacity: 1,
+      },
+      miniButton: {
+        padding: '3px 8px',
+        borderRadius: 7,
+        border: `1px solid ${BORDER}`,
+        background: 'transparent',
+        color: 'inherit',
+        font: 'inherit',
+        fontSize: 11.5,
+        cursor: 'pointer',
+      },
+
       field: { display: 'flex', flexDirection: 'column', gap: 6 },
       grid: {
         display: 'grid',
@@ -469,7 +544,7 @@ window.__ModuleLoader__.load({
         flexWrap: 'wrap',
         padding: '10px 2px',
         borderTop: `1px solid ${BORDER}`,
-        background: 'var(--dsh-surface, Canvas)',
+        background: 'var(--dsh-surface, rgba(127,127,127,.08))',
         backdropFilter: 'blur(8px)',
       },
       footerState: { display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0, flex: '1 1 auto' },
@@ -519,6 +594,7 @@ window.__ModuleLoader__.load({
       'followUpQuoteReply',
       'followUpAckFastPath',
       'followUpStickerEnabled',
+      'followUpTopicAnchor',
     ];
     const NUM_KEYS = [
       'historyMediaMaxMB',
@@ -565,6 +641,7 @@ window.__ModuleLoader__.load({
       burst: false,
       flood: false,
       judge: false,
+      history: false,
       advanced: false,
     };
 
@@ -581,6 +658,15 @@ window.__ModuleLoader__.load({
       for (const key of BOOL_KEYS) if (typeof cfg[key] === 'boolean') body[key] = cfg[key];
       for (const key of NUM_KEYS) if (cfg[key] !== undefined) body[key] = Number(cfg[key]);
       for (const key of STR_KEYS) if (typeof cfg[key] === 'string') body[key] = cfg[key];
+      if (Array.isArray(cfg.followUpJudgeExamples)) {
+        body.followUpJudgeExamples = cfg.followUpJudgeExamples
+          .slice(0, 5)
+          .map((item) => ({
+            text: String(item?.text ?? '').slice(0, 120),
+            verdict: item?.verdict === 'ignore' ? 'ignore' : 'reply',
+          }))
+          .filter((item) => item.text);
+      }
       return body;
     }
 
@@ -878,6 +964,35 @@ window.__ModuleLoader__.load({
         else if (status.reason) bits.push({ key: 'idle', text: status.reason, tone: 'warn' });
         return bits;
       }, [status, t]);
+
+      const judgeRecent = Array.isArray(status?.followUpJudge?.recent) ? status.followUpJudge.recent : [];
+      const judgeExamples = Array.isArray(config?.followUpJudgeExamples) ? config.followUpJudgeExamples : [];
+      const historySummary = judgeRecent.length
+        ? `${judgeRecent.length} ${t('historyCount')}${
+            judgeExamples.length ? ` · ${t('corrTag')} ${judgeExamples.length}/5` : ''
+          }`
+        : t('historyEmpty');
+
+      const addJudgeExample = useCallback((entry, verdict) => {
+        const text = String(entry?.text ?? '').slice(0, 120);
+        if (!text) return;
+        setConfig((prev) => {
+          const list = Array.isArray(prev?.followUpJudgeExamples) ? prev.followUpJudgeExamples : [];
+          return {
+            ...(prev ?? {}),
+            followUpJudgeExamples: [{ text, verdict }, ...list.filter((item) => item.text !== text)].slice(0, 5),
+          };
+        });
+        setNotice('');
+      }, []);
+
+      const removeJudgeExample = useCallback((text) => {
+        setConfig((prev) => {
+          const list = Array.isArray(prev?.followUpJudgeExamples) ? prev.followUpJudgeExamples : [];
+          return { ...(prev ?? {}), followUpJudgeExamples: list.filter((item) => item.text !== text) };
+        });
+        setNotice('');
+      }, []);
 
       if (loading) {
         return h('div', { style: S.root }, h('p', { style: S.hint }, t('loading')));
@@ -1319,6 +1434,16 @@ window.__ModuleLoader__.load({
             }),
           ),
           h('p', { style: S.hint }, t('followUpJudgeHint')),
+          h(Row, {
+            id: 'qqbot-guard-followup-topic',
+            label: t('topicAnchor'),
+            hint: t('topicAnchorHint'),
+            control: h(Toggle, {
+              id: 'qqbot-guard-followup-topic',
+              checked: config.followUpTopicAnchor !== false,
+              onChange: (value) => patch('followUpTopicAnchor', value),
+            }),
+          }),
           h(SelectField, {
             id: 'qqbot-guard-followup-error',
             label: t('followUpOnError'),
@@ -1330,6 +1455,93 @@ window.__ModuleLoader__.load({
             ],
             onChange: (value) => patch('followUpOnJudgeError', value),
           }),
+        ),
+
+        // 判定记录与纠正
+        h(
+          Card,
+          {
+            cardId: 'history',
+            title: t('groupHistory'),
+            summary: historySummary,
+            open: open.history,
+            onToggle: toggle,
+          },
+          judgeRecent.length === 0
+            ? h('p', { style: S.hint }, t('historyEmpty'))
+            : h(
+                'div',
+                null,
+                judgeRecent
+                  .slice()
+                  .reverse()
+                  .map((entry) =>
+                    h(
+                      'div',
+                      { key: entry.id, style: S.judgeRow },
+                      h(
+                        'span',
+                        { style: S.judgeTime },
+                        new Date(entry.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+                      ),
+                      h(
+                        'span',
+                        {
+                          style: {
+                            ...S.verdict,
+                            ...(entry.verdict === 'reply' ? S.verdictReply : null),
+                          },
+                        },
+                        t(
+                          entry.verdict === 'reply'
+                            ? 'verdictReply'
+                            : entry.verdict === 'ack'
+                              ? 'verdictAck'
+                              : 'verdictIgnore',
+                        ),
+                      ),
+                      h('span', { style: S.judgeText, title: entry.text }, entry.text),
+                      h(
+                        'span',
+                        { style: S.judgeActions },
+                        h(
+                          'button',
+                          { type: 'button', style: S.miniButton, onClick: () => addJudgeExample(entry, 'reply') },
+                          t('corrReply'),
+                        ),
+                        h(
+                          'button',
+                          { type: 'button', style: S.miniButton, onClick: () => addJudgeExample(entry, 'ignore') },
+                          t('corrIgnore'),
+                        ),
+                      ),
+                    ),
+                  ),
+              ),
+          judgeExamples.length > 0
+            ? h(
+                'div',
+                null,
+                h('p', { style: S.hint }, `${t('corrTag')} ${judgeExamples.length}/5`),
+                judgeExamples.map((item) =>
+                  h(
+                    'div',
+                    { key: item.text, style: S.judgeRow },
+                    h('span', { style: S.judgeText, title: item.text }, item.text),
+                    h(
+                      'span',
+                      { style: S.judgeActions },
+                      h(
+                        'button',
+                        { type: 'button', style: S.miniButton, onClick: () => removeJudgeExample(item.text) },
+                        t('corrRemove'),
+                      ),
+                    ),
+                  ),
+                ),
+              )
+            : null,
+          h('p', { style: S.hint }, t('historyHint')),
         ),
 
         // 高级
